@@ -3,7 +3,112 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 
-import { scanActions, ScanStatusPanel } from './ScanDetail.jsx';
+import {
+  loadModelReferences,
+  mergeRunSettingsDraft,
+  runSettingsDraft,
+  runSettingsPayload,
+  scanActions,
+  ScanStatusPanel,
+} from './ScanDetail.jsx';
+
+describe('scan model references', () => {
+  it('keeps OpenRouter exact-ID editing available when catalog discovery fails', async () => {
+    const catalogError = new Error('catalog unavailable');
+    const references = await loadModelReferences(
+      async () => ({ providers: ['openrouter'] }),
+      async () => {
+        throw catalogError;
+      }
+    );
+
+    expect(references).toEqual({ providers: ['openrouter'], catalog: {}, catalogError });
+  });
+
+  it('still treats provider discovery failure as blocking', async () => {
+    await expect(
+      loadModelReferences(
+        async () => {
+          throw new Error('providers unavailable');
+        },
+        async () => ({ providers: [] })
+      )
+    ).rejects.toThrow('providers unavailable');
+  });
+});
+
+describe('scan run settings', () => {
+  const current = {
+    model: 'gpt-5-codex',
+    model_provider: 'codex',
+    thinking_effort: 'medium',
+    harness: 'codex',
+    model_overrides: {},
+    job_limit: '250',
+  };
+
+  it('preserves the job limit when catalog normalization returns only model fields', () => {
+    const catalogDraft = {
+      model: 'gpt-5-codex',
+      model_provider: 'codex',
+      thinking_effort: 'medium',
+      harness: 'codex',
+    };
+
+    expect(mergeRunSettingsDraft(current, catalogDraft)).toEqual(current);
+    expect(runSettingsPayload(catalogDraft, current)).toEqual({});
+  });
+
+  it('normalizes older scan records into complete string-valued drafts', () => {
+    expect(runSettingsDraft({ model: 'legacy-model' })).toEqual({
+      model: 'legacy-model',
+      model_provider: 'openrouter',
+      thinking_effort: 'medium',
+      harness: 'codex',
+      model_overrides: {},
+      job_limit: '',
+    });
+  });
+
+  it('treats fields missing from a partial draft as unchanged', () => {
+    expect(runSettingsPayload({ model: ' replacement-model ' }, current)).toEqual({ model: 'replacement-model' });
+  });
+
+  it('still supports setting and clearing a job limit', () => {
+    expect(runSettingsPayload({ job_limit: ' 25 ' }, { ...current, job_limit: '' })).toEqual({ jobLimit: 25 });
+    expect(runSettingsPayload({ job_limit: '' }, current)).toEqual({ jobLimit: null });
+  });
+
+  it('replaces or clears normalized workflow-depth model overrides', () => {
+    const override = {
+      1: {
+        model: 'claude-sonnet',
+        modelProvider: 'claude',
+        harness: 'claude-code',
+        thinkingEffort: 'high',
+      },
+    };
+    expect(runSettingsPayload({ model_overrides: override }, current)).toEqual({
+      model_overrides: {
+        1: {
+          model: 'claude-sonnet',
+          model_provider: 'claude',
+          harness: 'claude-code',
+          thinking_effort: 'high',
+        },
+      },
+    });
+    expect(
+      runSettingsPayload(
+        { model_overrides: {} },
+        {
+          ...current,
+          model_overrides: override,
+        }
+      )
+    ).toEqual({ model_overrides: {} });
+  });
+});
 
 describe('scan lifecycle actions', () => {
   it('offers stop controls without allowing active deletion', () => {

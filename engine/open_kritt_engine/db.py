@@ -527,6 +527,7 @@ class Database:
             SET reasoning = nullif(reasoning - 'storage_warning', '{}'::jsonb),
                 updated_at = now()
             WHERE id = %s
+              AND jsonb_typeof(reasoning) = 'object'
               AND reasoning ? 'storage_warning'
             RETURNING id
             """,

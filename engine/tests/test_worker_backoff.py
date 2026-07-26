@@ -535,7 +535,7 @@ def test_docker_cleanup_steps_continue_after_one_failure(monkeypatch):
     assert worker._docker_storage_cleanup_lock.acquire(blocking=False)
 
 
-def test_storage_warning_is_persisted_inside_scan_reasoning():
+def test_storage_warning_is_persisted_inside_object_normalized_scan_reasoning():
     conn = _RecordingConnection(rows=({"id": 58},))
 
     assert Database("").set_scan_storage_warning(
@@ -548,6 +548,7 @@ def test_storage_warning_is_persisted_inside_scan_reasoning():
     query, params = conn.calls[0]
     assert "'{storage_warning}'" in query
     assert "jsonb_typeof(reasoning) = 'object'" in query
+    assert "ELSE '{}'::jsonb" in query
     assert "status IN ('prewarming_cache', 'running', 'post_processing')" in query
     assert params[0].obj["code"] == "low_storage"
     assert params[0].obj["free_bytes"] == 12 * 1024**3
@@ -561,6 +562,7 @@ def test_storage_warning_clear_preserves_other_scan_reasoning():
 
     query, params = conn.calls[0]
     assert "reasoning - 'storage_warning'" in query
+    assert "jsonb_typeof(reasoning) = 'object'" in query
     assert params == (58,)
 
 

@@ -18,10 +18,11 @@ import { configuredModelCatalog, configuredModelProviders } from '../lib/modelPr
 import { createLatestFieldMutationQueue } from '../lib/latestMutation.js';
 import { duplicateScanPath } from '../lib/scanDuplication.js';
 import { useUnsavedChangesPrompt } from '../lib/useUnsavedChangesPrompt.js';
-import ModelConfiguration, {
-  modelConfigurationForCatalog,
-  modelConfigurationIsValid,
-} from '../components/ModelConfiguration.jsx';
+import WorkflowModelConfiguration, {
+  workflowModelConfigurationForCatalog,
+  workflowModelConfigurationIsValid,
+} from '../components/WorkflowModelConfiguration.jsx';
+import { modelOverridesDraft, modelOverridesEqual, reconcileModelOverrides } from '../lib/modelOverrides.js';
 import { usePagination } from '../lib/usePagination.js';
 import Pagination from '../components/Pagination.jsx';
 
@@ -35,6 +36,23 @@ export function scanActions(status) {
     ),
     canDelete: isScanDeletable(status),
     stopLabel: ['queued', 'pending'].includes(status) ? 'Cancel' : status === 'rate_limited' ? 'Stop retrying' : 'Stop',
+  };
+}
+
+export async function loadModelReferences(fetchProviders, fetchCatalog) {
+  const [providerPayload, catalogResult] = await Promise.all([
+    Promise.resolve().then(fetchProviders),
+    Promise.resolve()
+      .then(fetchCatalog)
+      .then(
+        (catalog) => ({ catalog, error: null }),
+        (error) => ({ catalog: null, error })
+      ),
+  ]);
+  return {
+    providers: configuredModelProviders(providerPayload),
+    catalog: configuredModelCatalog(catalogResult.catalog),
+    catalogError: catalogResult.error,
   };
 }
 
@@ -65,10 +83,10 @@ export default function ScanDetail() {
     reload: reloadModelReferences,
   } = useFetch(
     () =>
-      Promise.all([api.modelProviders(), api.modelCatalog()]).then(([providers, catalog]) => ({
-        providers: configuredModelProviders(providers),
-        catalog: configuredModelCatalog(catalog),
-      })),
+      loadModelReferences(
+        () => api.modelProviders(),
+        () => api.modelCatalog()
+      ),
     [],
     { pollMs: 5000 }
   );
@@ -236,8 +254,11 @@ export default function ScanDetail() {
             <div className="mono" style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 7 }}>
               {scan.workflowName} · {scan.modelProvider ? `${scan.modelProvider} · ` : ''}
               {scan.model} · {scan.harness}
-              {scan.thinkingEffort ? ` · ${scan.thinkingEffort}` : ''} ·{' '}
-              {scan.repoKind === 'local' ? 'local snapshot' : `@${scan.commitShort}`}
+              {scan.thinkingEffort ? ` · ${scan.thinkingEffort}` : ''}
+              {Object.keys(scan.modelOverrides || {}).length
+                ? ` · ${Object.keys(scan.modelOverrides).length} depth overrides`
+                : ''}{' '}
+              · {scan.repoKind === 'local' ? 'local snapshot' : `@${scan.commitShort}`}
             </div>
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -387,6 +408,7 @@ export default function ScanDetail() {
           references={modelReferences}
           referencesLoading={modelReferencesLoading}
           referencesError={modelReferencesError}
+          catalogError={modelReferences?.catalogError}
           onRetryReferences={reloadModelReferences}
         />
 
@@ -644,7 +666,7 @@ export default function ScanDetail() {
                   textTransform: 'uppercase',
                 }}
               >
-                Type
+                Actor / Type
               </span>
             </div>
             {findingPages.pageItems.map((v) => {
@@ -802,29 +824,7 @@ export default function ScanDetail() {
                     </span>
                   </div>
                   <ChipList chips={chips} fallback={postOutputSummary(v)} />
-                  <div style={{ minWidth: 0 }}>
-                    <span
-                      className="mono"
-                      title={v.vulnerability_type || 'finding'}
-                      style={{
-                        display: 'inline-block',
-                        maxWidth: '100%',
-                        fontSize: 11.5,
-                        fontWeight: 700,
-                        padding: '4px 10px',
-                        borderRadius: 6,
-                        border: '1px solid var(--border)',
-                        background: 'var(--surface-2)',
-                        color: 'var(--text-2)',
-                        whiteSpace: 'nowrap',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        verticalAlign: 'middle',
-                      }}
-                    >
-                      {v.vulnerability_type || 'finding'}
-                    </span>
-                  </div>
+                  <FindingActorTypeCell maliciousActor={v.malicious_actor} vulnerabilityType={v.vulnerability_type} />
                 </div>
               );
             })}
@@ -840,28 +840,47 @@ export default function ScanDetail() {
   );
 }
 
-function ScanRunSettings({ scan, onSave, references, referencesLoading, referencesError, onRetryReferences }) {
+function ScanRunSettings({
+  scan,
+  onSave,
+  references,
+  referencesLoading,
+  referencesError,
+  catalogError,
+  onRetryReferences,
+}) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState(null);
   const current = runSettingsDraft(scan);
-  const activeDraft = draft || current;
+  const activeDraft = mergeRunSettingsDraft(current, draft);
   const payload = draft ? runSettingsPayload(draft, current) : {};
   const dirty = Object.keys(payload).length > 0;
-  const jobLimitValid =
-    !activeDraft.job_limit.trim() ||
-    (/^\d+$/.test(activeDraft.job_limit.trim()) &&
-      Number(activeDraft.job_limit) >= 1 &&
-      Number(activeDraft.job_limit) <= 1_000_000);
+  const workflowDepths = Array.isArray(scan.workflowDepths)
+    ? scan.workflowDepths
+    : Object.keys(current.model_overrides).map(Number);
+  const jobLimit = activeDraft.job_limit.trim();
+  const jobLimitValid = !jobLimit || (/^\d+$/.test(jobLimit) && Number(jobLimit) >= 1 && Number(jobLimit) <= 1_000_000);
   const valid =
-    jobLimitValid && !!references && modelConfigurationIsValid(activeDraft, references.providers, references.catalog);
+    jobLimitValid &&
+    !!references &&
+    workflowModelConfigurationIsValid(activeDraft, workflowDepths, references.providers, references.catalog);
   useUnsavedChangesPrompt(editing && (dirty || saving));
 
   const open = () => {
     const currentDraft = runSettingsDraft(scan);
+    const reconciledDraft = {
+      ...currentDraft,
+      model_overrides: reconcileModelOverrides(currentDraft.model_overrides, workflowDepths, currentDraft),
+    };
     setDraft(
-      references ? modelConfigurationForCatalog(currentDraft, references.providers, references.catalog) : currentDraft
+      references
+        ? mergeRunSettingsDraft(
+            reconciledDraft,
+            workflowModelConfigurationForCatalog(reconciledDraft, references.providers, references.catalog)
+          )
+        : reconciledDraft
     );
     setError(null);
     setEditing(true);
@@ -969,19 +988,16 @@ function ScanRunSettings({ scan, onSave, references, referencesLoading, referenc
 
       {editing ? (
         <>
-          <ModelConfiguration
+          <WorkflowModelConfiguration
             value={activeDraft}
             onChange={(nextDraft) =>
-              setDraft((currentDraft) => ({
-                ...currentDraft,
-                ...nextDraft,
-                job_limit: nextDraft.job_limit ?? currentDraft.job_limit,
-              }))
+              setDraft((currentDraft) => mergeRunSettingsDraft(currentDraft || current, nextDraft))
             }
             providers={references?.providers || []}
             catalog={references?.catalog || {}}
-            catalogError={referencesError}
+            catalogError={catalogError}
             disabled={saving}
+            depths={workflowDepths}
           />
           <label style={{ display: 'block', maxWidth: 280, marginTop: 13 }}>
             <span
@@ -1055,6 +1071,7 @@ function ScanRunSettings({ scan, onSave, references, referencesLoading, referenc
           <RuntimeSetting label="model_provider" value={current.model_provider || '—'} />
           <RuntimeSetting label="thinking_effort" value={current.thinking_effort || '—'} />
           <RuntimeSetting label="harness" value={current.harness} />
+          <RuntimeSetting label="depth overrides" value={Object.keys(current.model_overrides).length || 'none'} />
           <RuntimeSetting
             label="model jobs"
             value={`${scan.jobsStarted || 0} / ${scan.jobLimit == null ? 'unlimited' : scan.jobLimit}`}
@@ -1065,24 +1082,58 @@ function ScanRunSettings({ scan, onSave, references, referencesLoading, referenc
   );
 }
 
-function runSettingsDraft(scan) {
+export function runSettingsDraft(scan = {}) {
   return {
     model: scan.model || '',
     model_provider: scan.modelProvider || 'openrouter',
     thinking_effort: scan.thinkingEffort || 'medium',
     harness: scan.harness || 'codex',
+    model_overrides: modelOverridesDraft(scan.modelOverrides),
     job_limit: scan.jobLimit == null ? '' : `${scan.jobLimit}`,
   };
 }
 
-function runSettingsPayload(draft, current) {
+function runSettingsValue(value, fallback) {
+  if (value === undefined) return fallback;
+  if (value === null) return '';
+  return typeof value === 'string' ? value : String(value);
+}
+
+export function mergeRunSettingsDraft(current = {}, patch = {}) {
+  const hasModelOverrides = Object.prototype.hasOwnProperty.call(patch || {}, 'model_overrides');
+  const base = {
+    model: runSettingsValue(current?.model, ''),
+    model_provider: runSettingsValue(current?.model_provider, 'openrouter'),
+    thinking_effort: runSettingsValue(current?.thinking_effort, 'medium'),
+    harness: runSettingsValue(current?.harness, 'codex'),
+    model_overrides: modelOverridesDraft(current?.model_overrides),
+    job_limit: runSettingsValue(current?.job_limit, ''),
+  };
+  return {
+    model: runSettingsValue(patch?.model, base.model),
+    model_provider: runSettingsValue(patch?.model_provider, base.model_provider),
+    thinking_effort: runSettingsValue(patch?.thinking_effort, base.thinking_effort),
+    harness: runSettingsValue(patch?.harness, base.harness),
+    model_overrides: hasModelOverrides ? modelOverridesDraft(patch.model_overrides) : base.model_overrides,
+    job_limit: runSettingsValue(patch?.job_limit, base.job_limit),
+  };
+}
+
+export function runSettingsPayload(draft, current) {
+  const normalizedCurrent = mergeRunSettingsDraft({}, current);
+  const normalizedDraft = mergeRunSettingsDraft(normalizedCurrent, draft);
   const payload = {};
-  const model = draft.model.trim();
-  if (model !== current.model) payload.model = model;
-  if (draft.model_provider !== current.model_provider) payload.model_provider = draft.model_provider;
-  if (draft.thinking_effort !== current.thinking_effort) payload.thinking_effort = draft.thinking_effort;
-  if (draft.harness !== current.harness) payload.harness = draft.harness;
-  if (draft.job_limit !== current.job_limit) payload.jobLimit = draft.job_limit.trim() ? Number(draft.job_limit) : null;
+  const model = normalizedDraft.model.trim();
+  const jobLimit = normalizedDraft.job_limit.trim();
+  if (model !== normalizedCurrent.model) payload.model = model;
+  if (normalizedDraft.model_provider !== normalizedCurrent.model_provider)
+    payload.model_provider = normalizedDraft.model_provider;
+  if (normalizedDraft.thinking_effort !== normalizedCurrent.thinking_effort)
+    payload.thinking_effort = normalizedDraft.thinking_effort;
+  if (normalizedDraft.harness !== normalizedCurrent.harness) payload.harness = normalizedDraft.harness;
+  if (!modelOverridesEqual(normalizedDraft.model_overrides, normalizedCurrent.model_overrides))
+    payload.model_overrides = normalizedDraft.model_overrides;
+  if (normalizedDraft.job_limit !== normalizedCurrent.job_limit) payload.jobLimit = jobLimit ? Number(jobLimit) : null;
   return payload;
 }
 
@@ -1362,6 +1413,54 @@ export function ScanStatusPanel({ scan }) {
 // the key without the prefix; the value is shown below it. Capped at MAX_CHIPS.
 const CHIP_PREFIX = '_chip_';
 const MAX_CHIPS = 3;
+
+export function FindingActorTypeCell({ maliciousActor, vulnerabilityType }) {
+  const actor = typeof maliciousActor === 'string' && maliciousActor.trim() ? maliciousActor.trim() : '—';
+  const type = typeof vulnerabilityType === 'string' && vulnerabilityType.trim() ? vulnerabilityType.trim() : 'finding';
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 6, minWidth: 0 }}>
+      <span
+        className="mono"
+        aria-label={`Malicious actor: ${actor}`}
+        title={`Malicious actor: ${actor}`}
+        style={{
+          display: 'block',
+          maxWidth: '100%',
+          fontSize: 11.5,
+          fontWeight: 600,
+          color: 'var(--text)',
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+        }}
+      >
+        {actor}
+      </span>
+      <span
+        className="mono"
+        title={type}
+        style={{
+          display: 'inline-block',
+          maxWidth: '100%',
+          fontSize: 11.5,
+          fontWeight: 700,
+          padding: '4px 10px',
+          borderRadius: 6,
+          border: '1px solid var(--border)',
+          background: 'var(--surface-2)',
+          color: 'var(--text-2)',
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          verticalAlign: 'middle',
+        }}
+      >
+        {type}
+      </span>
+    </div>
+  );
+}
 
 function chipValue(value) {
   if (value === null || value === undefined) return '—';
