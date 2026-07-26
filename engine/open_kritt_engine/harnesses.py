@@ -30,7 +30,8 @@ NON_RETRYABLE_HARNESS_FAILURES = frozenset(
         "start_failed",
     }
 )
-RETRYABLE_RATE_LIMIT_FAILURES = frozenset({"rate_limited", "provider_throttled", "account_quota_limited"})
+CAPACITY_RATE_LIMIT_FAILURES = frozenset({"provider_throttled", "subagent_limited"})
+RETRYABLE_RATE_LIMIT_FAILURES = frozenset({"rate_limited", "account_quota_limited", *CAPACITY_RATE_LIMIT_FAILURES})
 
 HARNESS_FAILURE_MESSAGES = {
     "auth_failed": (
@@ -69,6 +70,10 @@ HARNESS_FAILURE_MESSAGES = {
     "account_quota_limited": (
         "The model provider reports that this account reached its usage quota. "
         "Wait for the quota window to reset or use another account."
+    ),
+    "subagent_limited": (
+        "Codex reached a separate premium limit while starting a subagent. "
+        "The account's normal usage quota may still be available; retry with less parallel work."
     ),
     "quota_exceeded": (
         "The model provider reports that the account quota is exhausted. Check the provider account and try again."
@@ -362,6 +367,19 @@ def _retry_after_seconds(output: str) -> float | None:
     if seconds:
         return max(0.0, float(seconds.group(1)))
 
+    retry_at_text = re.search(
+        r"(?i)\btry again at\s+([a-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4}\s+\d{1,2}:\d{2}\s+[ap]m)",
+        output or "",
+    )
+    if retry_at_text:
+        normalized = re.sub(r"(?i)(\d)(?:st|nd|rd|th)\b", r"\1", retry_at_text.group(1))
+        for date_format in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+            try:
+                retry_at = datetime.strptime(normalized, date_format).replace(tzinfo=timezone.utc)
+                return max(0.0, (retry_at - datetime.now(timezone.utc)).total_seconds())
+            except ValueError:
+                continue
+
     header = re.search(r"(?im)^retry-after\s*:\s*([^\r\n]+)", output or "")
     if not header:
         return None
@@ -438,7 +456,7 @@ def _classify_harness_output(output: str, *, provider: str | None = None) -> str
         )
     ):
         return "provider_throttled"
-    if any(
+    account_limit_signal = any(
         value in normalized
         for value in (
             "usage_limit",
@@ -447,7 +465,21 @@ def _classify_harness_output(output: str, *, provider: str | None = None) -> str
             "you have hit your limit",
             "key limit exceeded (total limit)",
         )
-    ):
+    )
+    subagent_limit_signal = any(
+        value in normalized
+        for value in (
+            '"limit_id":"premium"',
+            '"limit_id": "premium"',
+            "agent errored:",
+            "this agent's turn failed",
+            '"agent_status":{"errored"',
+            '"agent_status": {"errored"',
+        )
+    )
+    if account_limit_signal and subagent_limit_signal:
+        return "subagent_limited"
+    if account_limit_signal:
         return "account_quota_limited"
     rate_limit_signal = any(
         value in normalized
@@ -1310,6 +1342,7 @@ def codex_exec_command(
     thinking_effort: str | None,
     allow_tools: bool,
     codex_model_provider: str | None = None,
+    max_subagents: int | None = None,
 ) -> list[str]:
     """Build a Codex exec command while preserving scan-mode compatibility."""
 
@@ -1326,6 +1359,8 @@ def codex_exec_command(
     command.extend(["exec", "--json", "-C", repo_dir, "-m", model])
     if allow_tools:
         command.append("--dangerously-bypass-approvals-and-sandbox")
+        if max_subagents is not None:
+            command.extend(["-c", f"agents.max_concurrent_threads_per_session={max_subagents}"])
     else:
         command.extend(
             [
@@ -1365,11 +1400,13 @@ class CodexHarness:
         model_provider: str | None = None,
         cli_gate=None,
         codex_model_provider: str | None = None,
+        max_subagents: int = 5,
     ):
         self.timeout_seconds = timeout_seconds
         self.model_provider = model_provider
         self.codex_model_provider = codex_model_provider
         self.cli_gate = cli_gate
+        self.max_subagents = max(1, min(int(max_subagents), 5))
 
     def run(
         self,
@@ -1415,6 +1452,7 @@ class CodexHarness:
                 codex_model_provider=self.codex_model_provider,
                 thinking_effort=thinking_effort,
                 allow_tools=allow_tools,
+                max_subagents=self.max_subagents if allow_tools else None,
             )
             if allow_tools:
                 cmd = _scan_docker_command(cmd, repo_dir, actual_env)
@@ -1511,6 +1549,8 @@ class CodexHarness:
             "-m",
             model,
             "--dangerously-bypass-approvals-and-sandbox",
+            "-c",
+            f"agents.max_concurrent_threads_per_session={self.max_subagents}",
             "-o",
             output_path,
         ]
@@ -1775,6 +1815,7 @@ def harness_for(
     model_provider: str | None = None,
     codex_model_provider: str | None = None,
     codex_cli_gate=None,
+    codex_max_subagents: int = 5,
 ):
     normalized = normalize_harness_name(name)
     provider = model_provider if model_provider is not None else codex_model_provider
@@ -1784,6 +1825,7 @@ def harness_for(
             model_provider=model_provider,
             cli_gate=codex_cli_gate,
             codex_model_provider=codex_model_provider,
+            max_subagents=codex_max_subagents,
         )
     if normalized == "claude-code":
         return ClaudeHarness(timeout_seconds, provider)

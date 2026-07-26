@@ -1,12 +1,14 @@
 import { readFile } from 'node:fs/promises';
 
+import { renewClaudeCredential } from './claudeCredentials.js';
 import { providerCredentialStatuses } from './providerCredentials.js';
+import { CLAUDE_HOME } from './providerLogins.js';
 
 const EXECUTOR_VIEW_URL = process.env.EXECUTOR_VIEW_URL || 'http://executor-view:8090';
 const EXECUTOR_VIEW_INTERNAL_TOKEN_FILE =
   process.env.EXECUTOR_VIEW_INTERNAL_TOKEN_FILE || '/executor-auth/internal-token';
 const ACCOUNT_PROVIDER_IDS = ['codex', 'claude', 'openrouter'];
-const EXECUTOR_ACCOUNT_TIMEOUT_MS = 45000;
+const EXECUTOR_ACCOUNT_TIMEOUT_MS = 180000;
 const ACCOUNT_STATUS_KINDS = new Set(['available', 'limited', 'stale', 'expired', 'warning', 'missing']);
 
 function safeText(value, limit = 500) {
@@ -148,22 +150,40 @@ export async function fetchExecutorProvider(
     internalToken,
     internalTokenFile,
     timeoutMs = EXECUTOR_ACCOUNT_TIMEOUT_MS,
+    claudeHome = CLAUDE_HOME,
+    renewClaudeLogin = renewClaudeCredential,
   } = {}
 ) {
   if (!ACCOUNT_PROVIDER_IDS.includes(providerId)) return null;
   try {
     const token = await executorInternalToken({ internalToken, internalTokenFile });
     if (!token) return null;
-    const url = new URL(`/api/accounts/${providerId}`, executorViewUrl);
-    if (refresh) url.searchParams.set('refresh', '1');
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      redirect: 'error',
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    if (!response.ok) return null;
-    const payload = await response.json();
-    return payload?.kind === providerId ? payload : null;
+    const requestProvider = async () => {
+      const url = new URL(`/api/accounts/${providerId}`, executorViewUrl);
+      if (refresh) url.searchParams.set('refresh', '1');
+      const response = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}` },
+        redirect: 'error',
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+      if (!response.ok) return null;
+      const payload = await response.json();
+      return payload?.kind === providerId ? payload : null;
+    };
+
+    let provider = await requestProvider();
+    const claudeLoginRejected =
+      providerId === 'claude' && refresh && provider?.accounts?.some((account) => account?.statusKind === 'expired');
+    if (claudeLoginRejected) {
+      let renewed = false;
+      try {
+        renewed = await renewClaudeLogin(claudeHome);
+      } catch {
+        // Preserve the sanitized sign-in response when local renewal cannot run.
+      }
+      if (renewed) provider = await requestProvider();
+    }
+    return provider;
   } catch {
     return null;
   }
@@ -174,6 +194,8 @@ export async function fetchExecutorAccounts({
   executorViewUrl = EXECUTOR_VIEW_URL,
   internalToken,
   internalTokenFile,
+  claudeHome,
+  renewClaudeLogin,
 } = {}) {
   const providers = await Promise.all(
     ACCOUNT_PROVIDER_IDS.map((providerId) =>
@@ -182,6 +204,8 @@ export async function fetchExecutorAccounts({
         executorViewUrl,
         internalToken,
         internalTokenFile,
+        claudeHome,
+        renewClaudeLogin,
       })
     )
   );

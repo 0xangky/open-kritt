@@ -11,7 +11,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,12 +30,17 @@ from .repository import (
     resolve_remote_head,
     snapshot_local_repo,
 )
-from .runtime_config import runtime_value
+from .runtime_config import runtime_int, runtime_value
 
 _PROVIDER_HOME_LOCK = threading.Lock()
 _PROVIDER_HOME_CURSORS: dict[str, int] = {}
 _PROVIDER_HOME_KEYS: dict[str, tuple[str, ...]] = {}
 _RATE_LIMITED_PROVIDER_HOMES: dict[str, set[str]] = {}
+_RATE_LIMITED_PROVIDER_HOME_MARKED_AT: dict[tuple[str, str], float] = {}
+_PROVIDER_ACCOUNT_HEALTH_CACHE: dict[tuple[str, str], tuple[float, dict[str, "_ProviderAccountHealth"]]] = {}
+_PROVIDER_ACCOUNT_HEALTH_LOCK = threading.Lock()
+_PROVIDER_ACCOUNT_GATES: dict[tuple[str, str], "_ProviderAccountGate"] = {}
+_PROVIDER_ACCOUNT_GATES_LOCK = threading.Lock()
 CACHE_READY_FILENAME = ".open-kritt-ready.json"
 CACHE_MARKER_VERSION = 3
 RESERVED_WORKSPACE_ENTRIES = {"WORKSPACE.json", "WORKSPACE.md"}
@@ -75,6 +84,18 @@ class PreparedWorkspaceTree:
     manifest: dict[str, Any]
     layout: str
     manifest_json: str
+
+
+class _ProviderAccountGate:
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.active = 0
+
+
+@dataclass(frozen=True)
+class _ProviderAccountHealth:
+    available: bool
+    observed_at: float | None
 
 
 def prepare_job_workspace(
@@ -617,6 +638,27 @@ def scan_checkout_cache_key(scan: dict[str, Any]) -> str:
         "dependencies": _scan_dependencies(scan),
     }
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def scan_checkout_cache_entry_names(scan: dict[str, Any]) -> set[str]:
+    """Return the shared checkout-cache entries required by a resolved scan."""
+
+    return {path.name for path in _scan_cache_bases(Path("."), scan)}
+
+
+def scan_checkout_cache_entry_prefixes(scan: dict[str, Any]) -> set[str]:
+    """Return revision-independent entry prefixes needed by an active scan.
+
+    Scan rows may still say HEAD after the engine has pinned a concrete revision
+    in its on-disk manifest, so active cleanup protects every revision of the
+    referenced repositories until that scan becomes inactive.
+    """
+
+    prefixes = set()
+    for name in scan_checkout_cache_entry_names(scan):
+        base, separator, _revision = name.rpartition("@")
+        prefixes.add(f"{base}{separator}" if separator else name)
+    return prefixes
 
 
 def _has_remote_head(scan: dict[str, Any]) -> bool:
@@ -1181,14 +1223,21 @@ def provider_home_for_job(provider: str, metadata_id: int, *, data_dir: str | No
     homes = _configured_provider_homes(provider, data_dir=data_dir)
     if not homes:
         return "/root/.codex" if provider == "codex" else "/root/.claude"
+    live_health = _provider_account_health(provider)
     key = tuple(homes)
     with _PROVIDER_HOME_LOCK:
         if _PROVIDER_HOME_KEYS.get(provider) != key:
             _PROVIDER_HOME_KEYS[provider] = key
             _PROVIDER_HOME_CURSORS[provider] = 0
             _RATE_LIMITED_PROVIDER_HOMES.setdefault(provider, set()).intersection_update(homes)
+            for marked_key in tuple(_RATE_LIMITED_PROVIDER_HOME_MARKED_AT):
+                if marked_key[0] == provider and marked_key[1] not in homes:
+                    _RATE_LIMITED_PROVIDER_HOME_MARKED_AT.pop(marked_key, None)
         limited = _RATE_LIMITED_PROVIDER_HOMES.setdefault(provider, set())
-        selectable = [home for home in homes if home not in limited] or homes
+        _reconcile_provider_account_limits(provider, limited, live_health)
+        selectable = [
+            home for home in homes if home not in limited and _provider_account_is_available(live_health.get(home))
+        ] or homes
         cursor = _PROVIDER_HOME_CURSORS.get(provider, 0)
         home = selectable[cursor % len(selectable)]
         _PROVIDER_HOME_CURSORS[provider] = cursor + 1
@@ -1210,6 +1259,7 @@ def mark_provider_account_rate_limited(provider: str | None, home: str | None) -
         return
     with _PROVIDER_HOME_LOCK:
         _RATE_LIMITED_PROVIDER_HOMES.setdefault(provider, set()).add(home)
+        _RATE_LIMITED_PROVIDER_HOME_MARKED_AT[(provider, home)] = time.time()
 
 
 def mark_provider_account_available(provider: str | None, home: str | None) -> None:
@@ -1217,6 +1267,64 @@ def mark_provider_account_available(provider: str | None, home: str | None) -> N
         return
     with _PROVIDER_HOME_LOCK:
         _RATE_LIMITED_PROVIDER_HOMES.setdefault(provider, set()).discard(home)
+        _RATE_LIMITED_PROVIDER_HOME_MARKED_AT.pop((provider, home), None)
+
+
+def _provider_account_is_available(health: _ProviderAccountHealth | None) -> bool:
+    return health is None or health.available
+
+
+def _reconcile_provider_account_limits(
+    provider: str,
+    limited: set[str],
+    live_health: dict[str, _ProviderAccountHealth],
+) -> None:
+    """Release local quarantine after a newer authoritative healthy observation."""
+
+    for home in tuple(limited):
+        health = live_health.get(home)
+        marked_at = _RATE_LIMITED_PROVIDER_HOME_MARKED_AT.get((provider, home))
+        if (
+            health
+            and health.available
+            and health.observed_at is not None
+            and marked_at is not None
+            and health.observed_at > marked_at
+        ):
+            limited.discard(home)
+            _RATE_LIMITED_PROVIDER_HOME_MARKED_AT.pop((provider, home), None)
+
+
+def _provider_account_worker_limit(data_dir: str | None = None) -> int:
+    return runtime_int(
+        "ENGINE_WORKERS_PER_ACCOUNT",
+        15,
+        data_dir=data_dir,
+        minimum=1,
+        maximum=128,
+    )
+
+
+@contextmanager
+def provider_account_lease(provider: str | None, home: str | None, *, data_dir: str | None = None):
+    """Limit concurrent root model calls assigned to one native provider account."""
+
+    if provider not in {"codex", "claude"} or not home:
+        yield
+        return
+    key = (provider, home)
+    with _PROVIDER_ACCOUNT_GATES_LOCK:
+        gate = _PROVIDER_ACCOUNT_GATES.setdefault(key, _ProviderAccountGate())
+    with gate.condition:
+        while gate.active >= _provider_account_worker_limit(data_dir):
+            gate.condition.wait(timeout=1.0)
+        gate.active += 1
+    try:
+        yield
+    finally:
+        with gate.condition:
+            gate.active -= 1
+            gate.condition.notify_all()
 
 
 def provider_accounts_all_rate_limited(provider: str | None, *, data_dir: str | None = None) -> bool:
@@ -1225,9 +1333,78 @@ def provider_accounts_all_rate_limited(provider: str | None, *, data_dir: str | 
     homes = _configured_provider_homes(provider, data_dir=data_dir)
     if not homes:
         return True
+    live_health = _provider_account_health(provider)
     with _PROVIDER_HOME_LOCK:
         limited = _RATE_LIMITED_PROVIDER_HOMES.setdefault(provider, set())
-        return all(home in limited for home in homes)
+        _reconcile_provider_account_limits(provider, limited, live_health)
+        return all(home in limited or not _provider_account_is_available(live_health.get(home)) for home in homes)
+
+
+def _provider_account_health(provider: str) -> dict[str, _ProviderAccountHealth]:
+    """Return authoritative account availability from the local account service."""
+
+    if provider not in {"codex", "claude"}:
+        return {}
+    base_url = os.getenv("EXECUTOR_VIEW_URL", "").strip().rstrip("/")
+    token_path = os.getenv("EXECUTOR_VIEW_INTERNAL_TOKEN_FILE", "").strip()
+    if not base_url or not token_path:
+        return {}
+    try:
+        token = Path(token_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not token or len(token) > 4096:
+        return {}
+
+    cache_seconds = 15.0
+    cache_key = (provider, base_url)
+    now = time.monotonic()
+    with _PROVIDER_ACCOUNT_HEALTH_LOCK:
+        cached = _PROVIDER_ACCOUNT_HEALTH_CACHE.get(cache_key)
+        if cached and now < cached[0]:
+            return dict(cached[1])
+        request = urllib.request.Request(
+            f"{base_url}/api/accounts/{provider}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, urllib.error.URLError):
+            _PROVIDER_ACCOUNT_HEALTH_CACHE[cache_key] = (now + cache_seconds, {})
+            return {}
+
+        health: dict[str, _ProviderAccountHealth] = {}
+        generated_at = payload.get("generatedAt") if isinstance(payload, dict) else None
+        for account in payload.get("accounts", []) if isinstance(payload, dict) else []:
+            if not isinstance(account, dict):
+                continue
+            home = str(account.get("path") or "").strip()
+            if not home:
+                continue
+            status = str(account.get("statusKind") or "").strip().lower()
+            rate_limits = account.get("rateLimits")
+            observed_at = rate_limits.get("observedAt") if isinstance(rate_limits, dict) else generated_at
+            health[home] = _ProviderAccountHealth(
+                available=bool(account.get("active")) and status not in {"limited", "expired", "missing"},
+                observed_at=_provider_health_timestamp(observed_at),
+            )
+        _PROVIDER_ACCOUNT_HEALTH_CACHE[cache_key] = (time.monotonic() + cache_seconds, health)
+        return dict(health)
+
+
+def _provider_health_timestamp(value: Any) -> float | None:
+    if isinstance(value, int | float):
+        return float(value)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _configured_provider_homes(provider: str, *, data_dir: str | None = None) -> list[str]:

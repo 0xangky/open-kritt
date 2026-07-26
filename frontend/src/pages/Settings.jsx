@@ -25,10 +25,27 @@ const PRESENTATION = {
     unit: 'workers',
     description: 'Hard cap for one scan. Set 0 to divide worker slots automatically and fairly across active scans.',
   },
-  autoscaleScanWorkersOnProviderCapacity: {
-    label: 'Autoscale scan workers on provider capacity errors',
+  workersPerAccount: {
+    label: 'Workers per account',
+    unit: 'workers',
     description:
-      'When a provider reports temporary server-capacity throttling, lower only that scan’s future worker cap by one and retry. Account quota errors are not autoscaled.',
+      'Maximum concurrent root model calls assigned to the same provider account across scans. Codex subagents inside each session use their separate cap.',
+  },
+  autoscaleScanWorkersOnProviderCapacity: {
+    label: 'Autoscale scan workers on capacity errors',
+    description:
+      'When a provider reports temporary server-capacity throttling or Codex reaches its separate subagent limit, lower only that scan’s future worker cap by one and retry. Account quota errors are not autoscaled.',
+  },
+  codexMaxSubagentsPerSession: {
+    label: 'Codex subagents per session',
+    unit: 'subagents',
+    description: 'Hard cap for concurrently running child agents inside each Codex scan session.',
+  },
+  minFreeStorageGb: {
+    label: 'Minimum free storage',
+    unit: 'GiB',
+    description:
+      'Pause new scan containers when free disk space falls below this level. Lowering it can keep scans moving, but increases the risk of filling the disk completely.',
   },
   workspaceSetupConcurrency: {
     label: 'Workspace setup concurrency',
@@ -275,7 +292,8 @@ function BooleanRuntimeSetting({ name, presentation, setting, value, issue, disa
 }
 
 function RuntimeSetting({ name, presentation, setting, value, issue, disabled, onChange }) {
-  const numericValue = /^-?\d+$/.test(`${value}`.trim()) ? Number(value) : null;
+  const rawValue = `${value}`.trim();
+  const numericValue = rawValue && Number.isFinite(Number(rawValue)) ? Number(rawValue) : null;
   const aboveRecommendation = numericValue !== null && numericValue > setting.recommendedMax;
   const paused = name === 'workerCount' && numericValue === 0;
   return (
@@ -295,10 +313,10 @@ function RuntimeSetting({ name, presentation, setting, value, issue, disabled, o
         id={`setting-${name}`}
         className="mono settings-number-input"
         type="number"
-        inputMode="numeric"
+        inputMode={setting.type === 'number' ? 'decimal' : 'numeric'}
         min={setting.min}
         max={setting.max}
-        step="1"
+        step={setting.step || 1}
         value={value}
         disabled={disabled}
         aria-invalid={Boolean(issue) || !setting.valid}

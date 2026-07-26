@@ -53,7 +53,7 @@ over their prompts, workflows, model providers, and infrastructure.
 > bug-bounty payouts** under the researcher name **Blockian**
 > ([Immunefi](https://immunefi.com/profile/Blockian/) ·
 > [HackenProof](https://hackenproof.com/hackers/Blockian) ·
-> [blockian.xyz](https://blockian.xyz) · [@ControlZ_1337](https://x.com/ControlZ_1337)).
+> [blockian.xyz](https://blockian.xyz) · [@Kritt_AI](https://x.com/Kritt_AI)).
 > open·kritt is the open-source distillation of the internal project behind that work.
 
 ## Getting started

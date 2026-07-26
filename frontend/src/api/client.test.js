@@ -78,6 +78,7 @@ describe('provider account API', () => {
     }
 
     expect(request.url).toBe('/api/accounts/provider/claude?refresh=1');
+    expect(request.options.cache).toBe('no-store');
   });
 
   it('encodes account identifiers in the removal request', async () => {
