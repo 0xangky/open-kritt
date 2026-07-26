@@ -146,7 +146,7 @@ CODEX_RESET_URL = os.getenv(
     "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume",
 )
 CODEX_USAGE_TIMEOUT_SECONDS = float(
-    os.getenv("EXECUTOR_VIEW_CODEX_USAGE_TIMEOUT_SECONDS", "5")
+    os.getenv("EXECUTOR_VIEW_CODEX_USAGE_TIMEOUT_SECONDS", "15")
 )
 CODEX_RESET_TIMEOUT_SECONDS = float(
     os.getenv("EXECUTOR_VIEW_CODEX_RESET_TIMEOUT_SECONDS", "10")
@@ -189,7 +189,10 @@ CODEX_JOB_HOME_SCAN_LIMIT = int(
 )
 PREVIEW_TEXT_LIMIT = int(os.getenv("EXECUTOR_VIEW_PREVIEW_TEXT_LIMIT", "2000"))
 DETAIL_ATTEMPT_LIMIT = int(os.getenv("EXECUTOR_VIEW_DETAIL_ATTEMPT_LIMIT", "50"))
-SCAN_LIST_LIMIT = int(os.getenv("EXECUTOR_VIEW_SCAN_LIST_LIMIT", "50"))
+SCAN_LIST_LIMIT = max(1, int(os.getenv("EXECUTOR_VIEW_SCAN_LIST_LIMIT", "50")))
+SCAN_PAGE_SIZE = max(
+    1, min(SCAN_LIST_LIMIT, int(os.getenv("EXECUTOR_VIEW_SCAN_PAGE_SIZE", "6")))
+)
 PROMPT_PREVIEW_TEXT_LIMIT = int(
     os.getenv("EXECUTOR_VIEW_PROMPT_PREVIEW_TEXT_LIMIT", "600")
 )
@@ -728,36 +731,66 @@ def accounts_for_state(force=False):
     )
 
 
-def fetch_state(force_accounts=False):
+class ScanPaginationError(ValueError):
+    pass
+
+
+def pagination_integer(value):
+    text = str(value if value is not None else "")
+    if not re.fullmatch(r"\d+", text):
+        return None
+    number = int(text)
+    return number if number > 0 else None
+
+
+def scan_page_params(query):
+    page = pagination_integer((query.get("page") or ["1"])[0])
+    page_size = pagination_integer((query.get("pageSize") or [str(SCAN_PAGE_SIZE)])[0])
+    if page is None:
+        raise ScanPaginationError("Page must be a positive integer.")
+    if page_size is None or page_size > SCAN_LIST_LIMIT:
+        raise ScanPaginationError(f"Page size must be between 1 and {SCAN_LIST_LIMIT}.")
+    return page, page_size
+
+
+def scan_page_metadata(total_items, requested_page, page_size):
+    total_pages = max(1, (total_items + page_size - 1) // page_size)
+    page = min(requested_page, total_pages)
+    start_index = (page - 1) * page_size
+    return {
+        "page": page,
+        "pageSize": page_size,
+        "totalItems": total_items,
+        "totalPages": total_pages,
+        "startIndex": start_index,
+        "endIndex": min(start_index + page_size, total_items),
+    }
+
+
+def fetch_state(force_accounts=False, page=1, page_size=SCAN_PAGE_SIZE):
     accounts = accounts_for_state(force=force_accounts)
     with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
         status_counts = conn.execute(
             "SELECT status, count(*) AS count FROM public.scans GROUP BY status"
         ).fetchall()
+        total_scans = sum(int(row.get("count") or 0) for row in status_counts)
+        pagination = scan_page_metadata(total_scans, page, page_size)
         scans = conn.execute(
             """
             SELECT *
             FROM public.scans
-            ORDER BY
-                CASE status
-                    WHEN 'post_processing' THEN 0
-                    WHEN 'prewarming_cache' THEN 1
-                    WHEN 'running' THEN 2
-                    WHEN 'pending' THEN 3
-                    WHEN 'paused' THEN 4
-                    WHEN 'failed' THEN 5
-                    WHEN 'completed' THEN 6
-                    ELSE 7
-                END,
-                inserted_at ASC
-            LIMIT %s
+            ORDER BY updated_at DESC, id DESC
+            LIMIT %s OFFSET %s
             """,
-            (SCAN_LIST_LIMIT,),
+            (pagination["pageSize"], pagination["startIndex"]),
         ).fetchall()
         if not scans:
             return {
                 "generatedAt": datetime.now(timezone.utc),
-                "summary": summarize_scan_counts(status_counts, displayed=0),
+                "summary": summarize_scan_counts(
+                    status_counts, displayed=0, page_size=pagination["pageSize"]
+                ),
+                "pagination": pagination,
                 "codexAccounts": accounts["codex"],
                 "accounts": accounts,
                 "scans": [],
@@ -969,7 +1002,10 @@ def fetch_state(force_accounts=False):
     ]
     return {
         "generatedAt": datetime.now(timezone.utc),
-        "summary": summarize_scan_counts(status_counts, displayed=len(scans)),
+        "summary": summarize_scan_counts(
+            status_counts, displayed=len(scans), page_size=pagination["pageSize"]
+        ),
+        "pagination": pagination,
         "codexAccounts": accounts["codex"],
         "accounts": accounts,
         "scans": detailed,
@@ -994,7 +1030,7 @@ def split_home_list(raw):
     ]
 
 
-def summarize_scan_counts(status_counts, displayed):
+def summarize_scan_counts(status_counts, displayed, page_size=SCAN_LIST_LIMIT):
     counts = {
         str(row.get("status")): int(row.get("count") or 0) for row in status_counts
     }
@@ -1002,7 +1038,7 @@ def summarize_scan_counts(status_counts, displayed):
     return {
         "scans": total,
         "displayedScans": displayed,
-        "scanLimit": SCAN_LIST_LIMIT,
+        "scanLimit": page_size,
         "truncated": displayed < total,
         "pending": counts.get("pending", 0),
         "running": counts.get("prewarming_cache", 0) + counts.get("running", 0),
@@ -1261,11 +1297,14 @@ def fetch_claude_accounts(force=False):
             "primary": usage.get("primary"),
             "secondary": usage.get("secondary"),
         }
-    limited = any(
-        (numeric_value((limit_data or {}).get("usedPercent")) or 0) >= 100
-        for limit_data in (
-            (rate_limits or {}).get("primary"),
-            (rate_limits or {}).get("secondary"),
+    limited = not auth_error and (
+        numeric_value((usage or {}).get("statusCode")) == 429
+        or any(
+            (numeric_value((limit_data or {}).get("usedPercent")) or 0) >= 100
+            for limit_data in (
+                (rate_limits or {}).get("primary"),
+                (rate_limits or {}).get("secondary"),
+            )
         )
     )
     stale = bool(
@@ -1414,6 +1453,7 @@ def load_claude_oauth(home):
     an executor-view response, detail field, error, or log message.
     """
 
+    incomplete = None
     for path in (home / ".credentials.json", home / "credentials.json"):
         if not path.exists() or not path.is_file():
             continue
@@ -1428,20 +1468,42 @@ def load_claude_oauth(home):
             continue
         access_token = oauth.get("accessToken")
         access_token = access_token.strip() if isinstance(access_token, str) else ""
-        if access_token:
-            return {
-                "accessToken": access_token,
-                "expiresAt": oauth.get("expiresAt"),
-                "subscriptionType": format_account_value(oauth.get("subscriptionType")),
-                "rateLimitTier": format_account_value(oauth.get("rateLimitTier")),
-            }
-    return {}
+        refresh_token = oauth.get("refreshToken")
+        refresh_token = refresh_token.strip() if isinstance(refresh_token, str) else ""
+        candidate = {
+            "credentialFound": True,
+            "accessToken": access_token,
+            "expiresAt": oauth.get("expiresAt"),
+            "hasRefreshToken": bool(refresh_token),
+            "refreshTokenExpiresAt": oauth.get("refreshTokenExpiresAt"),
+            "subscriptionType": format_account_value(oauth.get("subscriptionType")),
+            "rateLimitTier": format_account_value(oauth.get("rateLimitTier")),
+        }
+        if access_token or refresh_token:
+            return candidate
+        if incomplete is None:
+            incomplete = candidate
+    return incomplete or {}
+
+
+def claude_refresh_token_is_usable(oauth):
+    if not (oauth or {}).get("hasRefreshToken"):
+        return False
+    expires_at = numeric_value((oauth or {}).get("refreshTokenExpiresAt"))
+    if expires_at is None:
+        return True
+    expiry_seconds = expires_at / 1000 if expires_at > 10_000_000_000 else expires_at
+    return expiry_seconds > datetime.now(timezone.utc).timestamp()
 
 
 def claude_auth_error(oauth, usage):
     """Return a sanitized, actionable error when Claude is not authenticated."""
 
+    refresh_token_usable = claude_refresh_token_is_usable(oauth)
     status_code = numeric_value((usage or {}).get("statusCode"))
+    # The usage probe only sends the access token; it cannot use the saved
+    # refresh token. If that probe rejects the login, surface the existing
+    # reconnect flow instead of presenting cached quota as current.
     if status_code in (401, 403):
         return (
             f"Claude rejected the saved login (HTTP {int(status_code)}). "
@@ -1456,6 +1518,12 @@ def claude_auth_error(oauth, usage):
         )
         if expiry_seconds <= datetime.now(timezone.utc).timestamp():
             return "Claude's saved OAuth login has expired. Sign in to Claude again to renew this account."
+    if (
+        (oauth or {}).get("credentialFound")
+        and not (oauth or {}).get("accessToken")
+        and not refresh_token_usable
+    ):
+        return "Claude's saved OAuth login is incomplete. Sign in to Claude again to renew this account."
     return None
 
 
@@ -2049,8 +2117,10 @@ def codex_account(home, job_rate_limits, force=False):
         "identity": identity,
         "email": email,
         "name": auth.get("name"),
-        "plan": auth_info.get("chatgpt_plan_type")
-        or (usage.get("planType") if usage else None)
+        # The live usage endpoint reflects plan upgrades before the persisted
+        # ID-token claim is refreshed, so prefer it for account status.
+        "plan": (usage.get("planType") if usage else None)
+        or auth_info.get("chatgpt_plan_type")
         or (rate_limits.get("raw") or {}).get("plan_type"),
         "active": active,
         "canRemove": account_id is not None,
@@ -3315,6 +3385,12 @@ HTML = r"""<!doctype html>
     main { flex:1; min-height:0; display:grid; grid-template-columns:330px minmax(0,1fr); overflow:hidden; }
     aside { border-right:1px solid var(--border); background:var(--side); padding:16px; overflow:auto; }
     .queue-title { color:var(--faint); font-size:10.5px; letter-spacing:.07em; margin:2px 0 10px 4px; }
+    .scan-pagination { display:flex; flex-direction:column; gap:8px; padding:4px 3px 2px; }
+    .scan-page-summary { color:var(--faint); font-size:10.5px; text-align:center; }
+    .scan-page-buttons { display:flex; align-items:center; justify-content:center; gap:5px; }
+    .scan-page-button { min-width:28px; height:28px; padding:0 7px; border-radius:7px; font-size:11.5px; }
+    .scan-page-button.active { color:var(--accent); border-color:var(--accent); background:#e8f0ff; }
+    .scan-page-ellipsis { color:var(--faint); padding:0 2px; }
     .scan { border:1px solid var(--border); border-radius:8px; padding:12px; margin-bottom:9px; cursor:pointer; }
     .scan.active { background:var(--surface); box-shadow:0 8px 24px rgba(0,0,0,.06); }
     .row { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
@@ -3372,12 +3448,15 @@ HTML = r"""<!doctype html>
     .error { color:var(--fail); font-size:11.5px; line-height:1.35; margin-top:7px; }
     .status-log { display:grid; grid-template-columns:minmax(0,1fr) minmax(280px,.65fr); gap:12px; margin-bottom:22px; }
     .status-box { border:1px solid var(--border); border-radius:8px; background:var(--surface); padding:13px 14px; min-width:0; }
-    .status-box.error-box { border-color:#efc2bb; background:#fff7f5; }
+    .status-box.error-box.recent-error-box { border-color:#efc2bb; background:#fff7f5; }
     .status-lines { display:grid; gap:8px; margin-top:10px; }
     .status-line { border:1px solid var(--border); border-radius:7px; padding:8px 9px; background:#fbfbf8; min-width:0; }
-    .status-line.error-line { border-color:#efc2bb; background:#fff; }
+    .status-line.error-line.recent-error { border-color:#efc2bb; background:#fff; }
     .status-line-title { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font-size:11px; margin-bottom:5px; }
-    .status-line-message { color:var(--fail); font-size:11.5px; line-height:1.4; overflow-wrap:anywhere; }
+    .status-line-message { color:var(--muted); font-size:11.5px; line-height:1.4; overflow-wrap:anywhere; }
+    .recent-error .status-line-message { color:var(--fail); }
+    .error-line:not(.recent-error) .known-error-chip { border-color:var(--border); background:var(--surface2); color:var(--muted); }
+    .error-line:not(.recent-error) .badge.failed { color:var(--muted); background:var(--surface2); }
     .known-error-chip { display:inline-flex; align-items:center; max-width:100%; border:1px solid #efc2bb; border-radius:999px; padding:2px 7px; background:var(--failbg); color:var(--fail); font-size:10.5px; white-space:nowrap; }
     .known-error-links { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; font-size:11px; line-height:1.2; }
     .known-error-links a { color:var(--accent); text-decoration:none; border-bottom:1px solid rgba(37,99,235,.28); }
@@ -3403,7 +3482,7 @@ HTML = r"""<!doctype html>
     <div id="stats" class="stats"></div>
   </header>
   <main id="main">
-    <aside><div class="mono queue-title">SCAN QUEUE</div><div id="queue"></div></aside>
+    <aside><div class="mono queue-title">SCAN QUEUE</div><div id="queue"></div><nav id="scan-pagination" class="scan-pagination" aria-label="Scan pagination"></nav></aside>
     <section class="content"><div id="detail"></div></section>
   </main>
 </div>
@@ -3413,6 +3492,8 @@ let selectedId = null;
 let openDetails = new Set();
 let fullPromptCache = new Map();
 let autoRenderDeferred = false;
+let scanPage = 1;
+let loadSequence = 0;
 
 const esc = (v) => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const knownErrorBadge = (item) => item?.knownError ? `<span class="known-error-chip">${esc(item.knownError.title || 'Known error')}</span>` : '';
@@ -3446,6 +3527,7 @@ const age = (v) => {
   return `${Math.floor(m / 60)}h ago`;
 };
 const time = (v) => v ? new Date(v).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : '—';
+const dateTime = (v) => v ? new Date(v).toLocaleString([], {dateStyle:'medium', timeStyle:'medium'}) : 'Unknown time';
 const statusBadge = (s, label = null) => `<span class="badge ${esc(s)}"><span class="dot"></span>${esc(label || s || 'unknown')}</span>`;
 const phaseBadge = (item) => statusBadge(item?.phase || item?.status, item?.phaseLabel || item?.status);
 const progress = (v) => `<div class="progress"><div class="bar" style="width:${Math.max(0, Math.min(100, Number(v)||0))}%"></div></div>`;
@@ -3544,6 +3626,7 @@ function setRefreshText(suffix='') {
 }
 
 async function load(options = {}) {
+  const requestId = ++loadSequence;
   const refreshButton = document.getElementById('refresh-button');
   const previousLabel = refreshButton?.textContent || 'Refresh';
   if (options.manual && refreshButton) {
@@ -3552,10 +3635,14 @@ async function load(options = {}) {
   }
   try {
     const url = new URL('/api/state', window.location.origin);
+    url.searchParams.set('page', String(scanPage));
     if (options.manual) url.searchParams.set('_', String(Date.now()));
     const res = await fetch(url, {cache: 'no-store'});
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    state = await res.json();
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(payload.error || `HTTP ${res.status}`);
+    if (requestId !== loadSequence) return;
+    state = payload;
+    scanPage = state.pagination?.page || 1;
     if (!selectedId || !state.scans.some(s => s.scan.id === selectedId)) {
       selectedId = (state.scans.find(s => s.scan.status === 'post_processing' || s.scan.status === 'prewarming_cache' || s.scan.status === 'running') || state.scans[0] || {scan:{}}).scan.id || null;
     }
@@ -3593,13 +3680,60 @@ async function scanAction(scanId, action, button) {
   await load({manual:true});
 }
 
+function paginationTokens(page, totalPages, maximum=5) {
+  if (totalPages <= maximum) return Array.from({length: totalPages}, (_, index) => index + 1);
+  const pages = new Set([1, totalPages, page - 1, page, page + 1]);
+  if (page <= 4) [2, 3, 4, 5].forEach(value => pages.add(value));
+  if (page >= totalPages - 3) [totalPages - 4, totalPages - 3, totalPages - 2, totalPages - 1].forEach(value => pages.add(value));
+  const sorted = [...pages].filter(value => value >= 1 && value <= totalPages).sort((left, right) => left - right);
+  const tokens = [];
+  for (const value of sorted) {
+    const previous = tokens[tokens.length - 1];
+    if (typeof previous === 'number' && value - previous > 1) tokens.push(`ellipsis-${previous}-${value}`);
+    tokens.push(value);
+  }
+  return tokens;
+}
+
+function goToScanPage(page) {
+  const totalPages = state?.pagination?.totalPages || 1;
+  const nextPage = Math.max(1, Math.min(totalPages, Number(page) || 1));
+  if (nextPage === scanPage) return;
+  scanPage = nextPage;
+  selectedId = null;
+  openDetails.clear();
+  load({manual:true});
+}
+
+function renderScanPagination() {
+  const target = document.getElementById('scan-pagination');
+  const pagination = state.pagination;
+  if (!pagination || pagination.totalItems <= pagination.pageSize) {
+    target.innerHTML = '';
+    return;
+  }
+  const tokens = paginationTokens(pagination.page, pagination.totalPages);
+  const buttons = tokens.map(token => typeof token === 'number'
+    ? `<button type="button" class="scan-page-button ${token === pagination.page ? 'active' : ''}" aria-label="Page ${token}" ${token === pagination.page ? 'aria-current="page"' : ''} onclick="goToScanPage(${token})">${token}</button>`
+    : '<span class="scan-page-ellipsis" aria-hidden="true">…</span>'
+  ).join('');
+  target.innerHTML = `
+    <div class="mono scan-page-summary">${pagination.startIndex + 1}–${pagination.endIndex} of ${pagination.totalItems} scans</div>
+    <div class="scan-page-buttons">
+      <button type="button" class="scan-page-button" aria-label="Previous scan page" ${pagination.page === 1 ? 'disabled' : ''} onclick="goToScanPage(${pagination.page - 1})">‹</button>
+      ${buttons}
+      <button type="button" class="scan-page-button" aria-label="Next scan page" ${pagination.page === pagination.totalPages ? 'disabled' : ''} onclick="goToScanPage(${pagination.page + 1})">›</button>
+    </div>`;
+}
+
 function render() {
   autoRenderDeferred = false;
   captureOpenDetails();
   document.getElementById('page-title').textContent = 'Executor';
-  const scanWindow = state.summary.truncated
-    ? ` Showing ${state.summary.displayedScans} of ${state.summary.scans} scans (limit ${state.summary.scanLimit}).`
-    : ` Showing all ${state.summary.scans} scans.`;
+  const pagination = state.pagination;
+  const scanWindow = pagination?.totalItems
+    ? ` Showing ${pagination.startIndex + 1}–${pagination.endIndex} of ${pagination.totalItems} scans.`
+    : ' No scans yet.';
   document.getElementById('page-sub').textContent = `Standalone queue view reading directly from Postgres.${scanWindow} Refreshes every 5 seconds.`;
   const active = (state.summary.running || 0) > 0 || (state.summary.postProcessing || 0) > 0;
   document.getElementById('engine-pill').className = `pill ${active ? 'run' : ''}`;
@@ -3615,6 +3749,7 @@ function render() {
     ['Completed', state.summary.completed, 'var(--ok)'],
   ].map(([label, value, color]) => `<div class="stat"><div class="mono label">${label}</div><div class="value" style="color:${color}">${value}</div></div>`).join('');
   document.getElementById('queue').innerHTML = state.scans.map(scanCard).join('') || '<div class="scan small">No scans yet.</div>';
+  renderScanPagination();
   const selected = state.scans.find(s => s.scan.id === selectedId) || state.scans[0];
   document.getElementById('detail').innerHTML = selected ? detail(selected) : '<div class="small">Select a scan.</div>';
   restoreOpenDetails();
@@ -3692,25 +3827,22 @@ function detail(entry) {
       ${metric('Enriched', p.enrichmentCount, 'var(--run)')}
       ${metric('Avg Time', ms(entry.totals.avgRuntimeMs))}
     </div>
-    ${statusPanel(entry)}
+    <div class="section-title">Workflow Steps</div><div class="section-sub">Expected/completed counts are lineages, not just static steps.</div>
+    <div class="panel" style="overflow:hidden;margin-bottom:22px">${entry.steps.map(step => stepRow(step, activeIds.has(step.id))).join('')}</div>
+    ${runningJobsPanel(entry)}
     <div class="section-title">Post-processing</div><div class="section-sub">Built-in dedupe/ranker and configured post-script enrichments.</div>
     <div class="panel" style="padding:14px;margin-bottom:22px">
       <div class="row"><div><div class="mono label">POST PROGRESS</div><div class="value">${p.completedAttempts} / ${p.attempts || 0} attempts</div></div><div class="value" style="color:var(--run)">${p.progressPct}%</div></div>
       <div style="margin-top:12px">${progress(p.progressPct)}</div>
       <div class="row small" style="margin-top:10px;flex-wrap:wrap"><span>${p.runningAttempts} running</span><span>${p.failedAttempts} failed</span><span>${p.unprocessedDedupeCount} not deduped</span><span>${p.unrankedCanonicalCount} unranked canonical</span><span>${p.pendingEnrichmentCount} pending enrichments</span></div>
     </div>
-    <div class="section-title">Workflow Steps</div><div class="section-sub">Expected/completed counts are lineages, not just static steps.</div>
-    <div class="panel" style="overflow:hidden;margin-bottom:22px">${entry.steps.map(step => stepRow(step, activeIds.has(step.id))).join('')}</div>
     <div class="cols">
       <div>
         <div class="section-title">Recent Attempts</div><div class="section-sub">Latest workflow, dedupe, ranker, and post-script metadata rows written by the executor.</div><div class="panel" style="overflow:hidden;margin-bottom:16px">${recentAttempts.length ? recentAttempts.map(row => row.html).join('') : '<div class="small" style="padding:18px">No attempts recorded yet.</div>'}</div>
         <div class="section-title">Post Attempts</div><div class="section-sub">Latest dedupe/ranker/post-script metadata rows.</div><div class="panel" style="overflow:hidden">${p.recentAttempts.length ? p.recentAttempts.map(postAttemptRow).join('') : '<div class="small" style="padding:18px">No post-processing attempts recorded yet.</div>'}</div>
       </div>
       <div>
-        <div class="section-title">Running Jobs</div><div class="section-sub">Claimed metadata rows currently executing or setting up isolated workspaces.</div>
-        <div class="panel" style="overflow:hidden;margin-bottom:16px">${q.activeJobs?.length ? q.activeJobs.map(runningJob).join('') : '<div class="small" style="padding:16px">No running jobs.</div>'}</div>
-        <div class="section-title">Running Post Jobs</div><div class="section-sub">Claimed post-processing metadata rows.</div>
-        <div class="panel" style="overflow:hidden;margin-bottom:16px">${p.activeJobs?.length ? p.activeJobs.map(postJob).join('') : '<div class="small" style="padding:16px">No running post-processing jobs.</div>'}</div>
+        ${recentErrorsPanel(entry)}
         <div class="section-title">Queued Jobs</div><div class="section-sub">Unclaimed work left in priority order.</div>
         <div class="panel" style="overflow:hidden">${q.nextJobs.length ? q.nextJobs.map(nextJob).join('') : '<div class="small" style="padding:16px">No queued jobs. Claimed jobs are shown above.</div>'}</div>
       </div>
@@ -3732,26 +3864,58 @@ function metric(label, value, color='var(--text)') {
   return `<div class="metric"><div class="mono label">${esc(label)}</div><div class="value" style="color:${color}">${esc(value)}</div></div>`;
 }
 
-function statusPanel(entry) {
-  const active = [
+function runningJobsPanel(entry) {
+  const jobs = [
     ...(entry.queue?.activeJobs || []).map(job => ({...job, group: 'workflow'})),
     ...(entry.postProcessing?.activeJobs || []).map(job => ({...job, group: 'post'})),
   ];
-  const errors = entry.errors || [];
-  if (!active.length && !errors.length) return '';
-  return `<div class="section-title">Status & Errors</div><div class="section-sub">Current executor activity and the latest captured scan, workflow, and post-processing failures.</div>
-    <div class="status-log">
+  return `<div class="section-title">Running Jobs</div><div class="section-sub">Claimed workflow and post-processing jobs currently executing or setting up isolated workspaces.</div>
+    <div class="status-log" style="grid-template-columns:1fr">
       <div class="status-box">
-        <div class="row"><div><div class="mono label">ACTIVE JOBS</div><div class="value">${active.length}</div></div><div>${statusBadge(entry.scan.status)}</div></div>
+        <div class="row"><div><div class="mono label">RUNNING JOBS</div><div class="value">${jobs.length}</div></div><div>${statusBadge(entry.scan.status)}</div></div>
         <div class="status-lines">
-          ${active.length ? active.slice(0, 8).map(activeLine).join('') : '<div class="small">No claimed jobs are currently running.</div>'}
+          ${jobs.length ? jobs.slice(0, 8).map(activeLine).join('') : '<div class="small">No jobs are currently running.</div>'}
+          ${jobs.length > 8 ? `<div class="mono small">+${jobs.length - 8} more running</div>` : ''}
         </div>
       </div>
-      <div class="status-box error-box">
-        <div class="row"><div><div class="mono label">RECENT ERRORS</div><div class="value" style="color:var(--fail)">${errors.length}</div></div>${errors[0] ? phaseBadge(errors[0]) : ''}</div>
-        <div class="status-lines">
-          ${errors.length ? errors.slice(0, 8).map(errorLine).join('') : '<div class="small">No error rows captured for this scan.</div>'}
-        </div>
+    </div>`;
+}
+
+function runTimestamp(value) {
+  const timestamp = value ? new Date(value).getTime() : Number.NaN;
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function latestRunTimestamp(entry) {
+  const attempts = [
+    ...(entry.attempts || []),
+    ...(entry.postProcessing?.recentAttempts || []),
+    ...(entry.queue?.activeJobs || []),
+    ...(entry.postProcessing?.activeJobs || []),
+  ];
+  const timestamps = attempts
+    .map(attempt => runTimestamp(attempt.runStartedAt || attempt.startedAt || attempt.insertedAt))
+    .filter(timestamp => timestamp !== null);
+  return timestamps.length ? Math.max(...timestamps) : null;
+}
+
+function errorShouldHighlight(entry, error) {
+  const errorAt = runTimestamp(error.updatedAt || error.insertedAt);
+  if (errorAt === null) return true;
+  if (Date.now() - errorAt <= 24 * 60 * 60 * 1000) return true;
+  const latestRunAt = latestRunTimestamp(entry);
+  return latestRunAt === null || latestRunAt <= errorAt;
+}
+
+function recentErrorsPanel(entry) {
+  const errors = entry.errors || [];
+  const highlighted = errors.filter(error => errorShouldHighlight(entry, error));
+  const latestErrorAt = errors[0]?.updatedAt || errors[0]?.insertedAt;
+  return `<div class="section-title">Recent Errors</div><div class="section-sub">Latest captured failures. Errors stay red for 24 hours, or until a later job runs.</div>
+    <div class="status-box error-box ${highlighted.length ? 'recent-error-box' : ''}" style="margin-bottom:16px">
+      <div class="row"><div><div class="mono label">ERRORS</div><div class="value" style="color:${highlighted.length ? 'var(--fail)' : 'var(--text)'}">${errors.length}</div></div>${latestErrorAt ? `<div class="mono small" title="${esc(dateTime(latestErrorAt))}">latest ${esc(age(latestErrorAt))}</div>` : ''}</div>
+      <div class="status-lines">
+        ${errors.length ? errors.slice(0, 8).map(error => errorLine(error, errorShouldHighlight(entry, error))).join('') : '<div class="small">No error rows captured for this scan.</div>'}
       </div>
     </div>`;
 }
@@ -3767,13 +3931,14 @@ function activeLine(job) {
   </div>`;
 }
 
-function errorLine(error) {
+function errorLine(error, highlighted=false) {
   const account = accountSummary(error);
-  return `<div class="status-line error-line">
-    <div class="status-line-title"><span>${esc(error.source)} · ${esc(error.title || error.kind || 'error')} ${knownErrorBadge(error)}</span><span>${esc(error.metadataId ? `metadata ${error.metadataId}` : time(error.updatedAt || error.insertedAt))}</span></div>
+  const occurredAt = error.updatedAt || error.insertedAt;
+  return `<div class="status-line error-line ${highlighted ? 'recent-error' : ''}">
+    <div class="status-line-title"><span>${esc(error.source)} · ${esc(error.title || error.kind || 'error')} ${knownErrorBadge(error)}</span><span title="${esc(age(occurredAt))}">${esc(dateTime(occurredAt))}</span></div>
     <div class="status-line-message">${esc(error.message || '')}</div>
     ${knownErrorLinks(error)}
-    <div class="mono small" style="margin-top:5px">${esc(error.phaseLabel || error.status || '')}${error.runTimeMs != null ? ` · ${ms(error.runTimeMs)}` : ''}${account ? ` · ${esc(account)}` : ''}</div>
+    <div class="mono small" style="margin-top:5px">${esc(error.phaseLabel || error.status || '')}${error.metadataId ? ` · metadata ${esc(error.metadataId)}` : ''}${error.runTimeMs != null ? ` · ${ms(error.runTimeMs)}` : ''}${account ? ` · ${esc(account)}` : ''}</div>
   </div>`;
 }
 
@@ -3840,11 +4005,6 @@ function nextJob(job, idx) {
   return `<div class="next"><div class="row"><span class="name" style="font-size:12.5px">d${job.depth} · ${esc(job.stepName)}</span><span class="mono small" style="color:var(--faint)">#${idx+1}</span></div><div class="mono small" style="margin-top:4px">prev ${job.prevId || 0} · repeat ${job.repeatRun} · ${esc(runConfigSummary(job))}</div></div>`;
 }
 
-function runningJob(job) {
-  const account = accountSummary(job);
-  return `<div class="next"><div class="row"><span class="name" style="font-size:12.5px">d${job.depth} · ${esc(job.stepName)}</span><span class="mono small" style="color:var(--run)">${ms(job.elapsedMs)}</span></div><div style="margin-top:7px">${phaseBadge(job)}</div><div class="mono small" style="margin-top:4px">metadata ${job.metadataId} · prev ${job.prevId || 0} · repeat ${job.repeatRun}${account ? ` · account ${esc(account)}` : ''} · ${esc(runConfigSummary(job))} · ${esc(subagentSummary(job))}</div></div>`;
-}
-
 function postAttemptRow(attempt) {
   const failed = attempt.status === 'failed';
   const runtime = attempt.status === 'running' ? `${ms(attempt.elapsedMs)} running` : ms(attempt.runTimeMs);
@@ -3885,17 +4045,6 @@ function postAttemptRow(attempt) {
         <pre>${esc(pretty({tokens: attempt.tokens, raw: attempt.rawTokenUsage}))}</pre>
       </details>
     </div>
-  </div>`;
-}
-
-function postJob(job) {
-  const targetSummary = (job.targetIds || []).length ? `${(job.targetIds || []).length} targets` : (job.vulnerabilityId ? `vuln ${job.vulnerabilityId}` : 'no targets');
-  const account = accountSummary(job);
-  return `<div class="next">
-    <div class="row"><span class="name" style="font-size:12.5px">${esc(job.kind)}${job.batchIndex != null ? ` · batch ${esc(job.batchIndex)}` : ''}</span><span class="mono small" style="color:var(--run)">${ms(job.elapsedMs)}</span></div>
-    <div style="margin-top:7px">${phaseBadge(job)}</div>
-    <div class="mono small" style="margin-top:4px">metadata ${job.id} · ${esc(targetSummary)}${account ? ` · account ${esc(account)}` : ''}</div>
-    <div class="mono small" style="margin-top:4px">${esc(runConfigSummary(job))} · ${esc(subagentSummary(job))}</div>
   </div>`;
 }
 
@@ -4012,10 +4161,24 @@ class Handler(BaseHTTPRequestHandler):
                 force_accounts = (query.get("refresh_accounts") or ["0"])[
                     0
                 ].lower() in ("1", "true", "yes")
+                page, page_size = scan_page_params(query)
                 body = json.dumps(
-                    fetch_state(force_accounts=force_accounts), default=encode
+                    fetch_state(
+                        force_accounts=force_accounts,
+                        page=page,
+                        page_size=page_size,
+                    ),
+                    default=encode,
                 ).encode("utf-8")
                 self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except ScanPaginationError as exc:
+                body = json.dumps({"error": str(exc)}).encode("utf-8")
+                self.send_response(422)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Length", str(len(body)))

@@ -240,6 +240,43 @@ describe('resumed scan error history', () => {
     expect(html).toContain('View usage and limits in Accounts');
   });
 
+  it('renders low-storage pause failures with the managed actionable message', () => {
+    const html = renderToStaticMarkup(
+      createElement(
+        MemoryRouter,
+        null,
+        createElement(ScanStatusPanel, {
+          scan: {
+            status: 'failed',
+            statusSummary: {
+              recentErrors: [
+                {
+                  id: 'storage-warning-1',
+                  source: 'Scan',
+                  title: 'Scan failure',
+                  phaseLabel: 'Failed',
+                  message:
+                    'Low-storage pause failed. The engine ran low on disk space, then could not save its automatic pause warning. Free disk space or lower Minimum free storage in Settings, then resume the scan; completed work is preserved.',
+                  knownError: {
+                    key: 'storage_warning_persistence_failed',
+                    title: 'Low-storage pause failed',
+                    fixLinks: [{ label: 'Open Settings', url: '/settings', internal: true }],
+                  },
+                },
+              ],
+            },
+          },
+        })
+      )
+    );
+
+    expect(html).toContain('Low-storage pause failed');
+    expect(html).toContain('Free disk space or lower Minimum free storage in Settings');
+    expect(html).toContain('href="/settings"');
+    expect(html).toContain('Open Settings');
+    expect(html).not.toContain('cannot set path in scalar');
+  });
+
   it('shows when each status error occurred', () => {
     const occurredAt = '2026-07-20T10:55:05.000Z';
     const label = new Intl.DateTimeFormat(undefined, {

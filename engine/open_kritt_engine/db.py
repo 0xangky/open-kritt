@@ -13,20 +13,25 @@ from .models import Step, StepResultRow, Workflow
 
 RATE_LIMIT_RETRY_BASE_SECONDS = 60.0
 RATE_LIMIT_RETRY_MAX_SECONDS = 10 * 60.0
+QUOTA_RETRY_MAX_SECONDS = 8 * 24 * 60 * 60.0
 QUEUED_SCAN_ADMISSION_LOCK = (0x6B726974, 0x71756575)
 
 
-def rate_limit_retry_delay(retry_count: int, provider_retry_after_seconds: float = 0.0) -> float:
+def rate_limit_retry_delay(
+    retry_count: int,
+    provider_retry_after_seconds: float = 0.0,
+    *,
+    maximum_seconds: float = RATE_LIMIT_RETRY_MAX_SECONDS,
+) -> float:
     """Return the persistent retry delay for a rate-limited scan."""
 
+    maximum_seconds = max(RATE_LIMIT_RETRY_BASE_SECONDS, float(maximum_seconds))
     exponent = max(0, retry_count - 1)
     exponential_delay = (
-        RATE_LIMIT_RETRY_MAX_SECONDS
-        if exponent >= 8
-        else min(RATE_LIMIT_RETRY_BASE_SECONDS * (2**exponent), RATE_LIMIT_RETRY_MAX_SECONDS)
+        maximum_seconds if exponent >= 8 else min(RATE_LIMIT_RETRY_BASE_SECONDS * (2**exponent), maximum_seconds)
     )
     provider_delay = max(0.0, float(provider_retry_after_seconds))
-    return min(max(exponential_delay, provider_delay), RATE_LIMIT_RETRY_MAX_SECONDS)
+    return min(max(exponential_delay, provider_delay), maximum_seconds)
 
 
 def _json(value):
@@ -559,7 +564,15 @@ class Database:
         if not isinstance(previous_retries, int) or isinstance(previous_retries, bool) or previous_retries < 0:
             previous_retries = 0
         retry_count = previous_retries + 1
-        retry_delay_seconds = rate_limit_retry_delay(retry_count, retry_after_seconds)
+        retry_delay_seconds = rate_limit_retry_delay(
+            retry_count,
+            retry_after_seconds,
+            maximum_seconds=(
+                QUOTA_RETRY_MAX_SECONDS
+                if limit_kind in {"account_quota_limited", "subagent_limited"}
+                else RATE_LIMIT_RETRY_MAX_SECONDS
+            ),
+        )
 
         next_reasoning = dict(reasoning) if isinstance(reasoning, dict) else {}
         next_reasoning.update(
@@ -570,7 +583,7 @@ class Database:
                 "retry_count": retry_count,
             }
         )
-        if autoscale_workers and limit_kind == "provider_throttled":
+        if autoscale_workers and limit_kind in {"provider_throttled", "subagent_limited"}:
             stored_cap = next_reasoning.get("provider_capacity_worker_cap")
             if not isinstance(stored_cap, int) or isinstance(stored_cap, bool) or stored_cap < 1:
                 stored_cap = current_worker_cap
@@ -1667,6 +1680,7 @@ class Database:
         conn,
         *,
         retain_inactive_scan_caches_after: datetime,
+        retain_finished_workspaces_after: datetime,
     ) -> tuple[set[int], set[int]]:
         # Keep cleanup mutually exclusive with scan admission. This prevents a
         # completed/failed scan from being resumed while its stale cache is
@@ -1677,14 +1691,14 @@ class Database:
             """
             SELECT id::bigint AS workspace_id
             FROM workflows.step_metadata
-            WHERE status = 'running'
+            WHERE (status = 'running' OR updated_at >= %s)
               AND coalesce(kind, 'step') = 'step'
             UNION ALL
             SELECT (%s::bigint + id)::bigint AS workspace_id
             FROM workflows.post_process_metadata
-            WHERE status = 'running'
+            WHERE status = 'running' OR updated_at >= %s
             """,
-            (POST_WORKSPACE_ID_OFFSET,),
+            (retain_finished_workspaces_after, POST_WORKSPACE_ID_OFFSET, retain_finished_workspaces_after),
         ).fetchall()
         scan_rows = conn.execute(
             """
@@ -1702,6 +1716,15 @@ class Database:
             {_to_int(row["workspace_id"]) for row in workspace_rows},
             {_to_int(row["id"]) for row in scan_rows},
         )
+
+    def load_active_scan_cache_specs(self, conn) -> list[dict[str, Any]]:
+        return conn.execute(
+            """
+            SELECT id, repo_kind, repo_full, commit_sha, dependencies, dependencies_detail
+            FROM public.scans
+            WHERE status IN ('queued', 'pending', 'prewarming_cache', 'running', 'rate_limited', 'post_processing')
+            """
+        ).fetchall()
 
 
 def now_utc():

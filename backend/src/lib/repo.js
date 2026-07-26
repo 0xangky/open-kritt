@@ -329,6 +329,15 @@ export function knownError(value) {
         'The scanner ran out of disk space while creating a job workspace. Free local disk space, then resume the scan.',
     };
   }
+  if (lower.includes('cannot set path in scalar')) {
+    return {
+      key: 'storage_warning_persistence_failed',
+      title: 'Low-storage pause failed',
+      message:
+        'The engine ran low on disk space, then could not save its automatic pause warning. Free disk space or lower Minimum free storage in Settings, then resume the scan; completed work is preserved.',
+      fixLinks: [{ label: 'Open Settings', url: '/settings', internal: true }],
+    };
+  }
   if (
     compact.includes(CYBER_RISK_FLAG_TEXT) ||
     lower.includes('openai has flagged these tasks as unauthorized') ||
@@ -388,6 +397,15 @@ export function knownError(value) {
       title: 'Provider busy',
       message:
         'The provider temporarily throttled server capacity. This did not mean the account usage quota was exhausted.',
+      preserveMessage: true,
+    };
+  }
+  if (lower.includes('diagnostic: subagent_limited')) {
+    return {
+      key: 'subagent_limited',
+      title: 'Subagent limit reached',
+      message:
+        "Codex reached a separate premium limit while starting a subagent. The account's normal usage quota may still be available.",
       preserveMessage: true,
     };
   }

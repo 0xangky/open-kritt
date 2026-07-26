@@ -85,15 +85,23 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql://open_kritt:open_kritt_password@db:5432/open_kritt?schema=public}
       ENGINE_DATA_DIR: ${ENGINE_DATA_DIR:-/data}
       ENGINE_MIN_FREE_STORAGE_GB: ${ENGINE_MIN_FREE_STORAGE_GB:-20}
+      ENGINE_AUTO_PRUNE_DOCKER_BUILD_CACHE: ${ENGINE_AUTO_PRUNE_DOCKER_BUILD_CACHE:-true}
+      ENGINE_AUTO_PRUNE_UNUSED_DOCKER_IMAGES: ${ENGINE_AUTO_PRUNE_UNUSED_DOCKER_IMAGES:-true}
+      ENGINE_DOCKER_BUILD_CACHE_KEEP_GB: ${ENGINE_DOCKER_BUILD_CACHE_KEEP_GB:-0}
+      ENGINE_DOCKER_BUILD_CACHE_PRUNE_INTERVAL_SECONDS: ${ENGINE_DOCKER_BUILD_CACHE_PRUNE_INTERVAL_SECONDS:-300}
       ENGINE_RUNTIME_CONFIG_PATH: ${ENGINE_RUNTIME_CONFIG_PATH:-/data/engine-runtime.env}
       ENGINE_CHECKOUT_CACHE_DIR: ${ENGINE_CHECKOUT_CACHE_DIR:-/checkout-cache}
       ENGINE_CHECKOUT_CACHE_PERSIST_DIR: ${ENGINE_CHECKOUT_CACHE_PERSIST_DIR:-/data/checkout-cache-persist}
-      ENGINE_SCAN_CACHE_RETENTION_DAYS: ${ENGINE_SCAN_CACHE_RETENTION_DAYS:-7}
+      ENGINE_SCAN_CACHE_RETENTION_DAYS: ${ENGINE_SCAN_CACHE_RETENTION_DAYS:-0}
       ENGINE_POLL_SECONDS: ${ENGINE_POLL_SECONDS:-5}
       ENGINE_WORKER_COUNT: ${ENGINE_WORKER_COUNT:-2}
       ENGINE_MAX_CONCURRENT_SCANS: ${ENGINE_MAX_CONCURRENT_SCANS:-1}
       ENGINE_MAX_WORKERS_PER_SCAN: ${ENGINE_MAX_WORKERS_PER_SCAN:-0}
+      ENGINE_WORKERS_PER_ACCOUNT: ${ENGINE_WORKERS_PER_ACCOUNT:-15}
       ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY: ${ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY:-true}
+      ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION: ${ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION:-5}
+      EXECUTOR_VIEW_URL: http://executor-view:8090
+      EXECUTOR_VIEW_INTERNAL_TOKEN_FILE: /executor-auth/internal-token
       ENGINE_WORKSPACE_SETUP_CONCURRENCY: ${ENGINE_WORKSPACE_SETUP_CONCURRENCY:-2}
       ENGINE_RETRY_COUNT: ${ENGINE_RETRY_COUNT:-2}
       ENGINE_HARNESS_TIMEOUT_SECONDS: ${ENGINE_HARNESS_TIMEOUT_SECONDS:-7200}
@@ -123,6 +131,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      executor-view:
+        condition: service_healthy
     volumes:
       - ./engine:/app
       - ${ENGINE_DATA_DIR_HOST:-./.data/engine}:/data
@@ -135,6 +145,7 @@ services:
       - ${ENGINE_CODEX_ACCOUNTS_HOST:-./.data/codex-accounts}:/run/open-kritt-secrets/codex-accounts:z
       - ${ENGINE_CODEX_HOME_SOURCE_HOST:-./.data/codex-home-source}:/run/open-kritt-secrets/codex-home-source:ro,z
       - ${ENGINE_CLAUDE_HOME:-./.data/claude}:/root/.claude
+      - ${EXECUTOR_VIEW_AUTH_HOST:-./.data/engine/executor-auth}:/executor-auth:ro
       - /var/run/docker.sock:/var/run/docker.sock
       # Local repositories are copied into scan-specific snapshots; the host source
       # never needs to be modified by the engine.

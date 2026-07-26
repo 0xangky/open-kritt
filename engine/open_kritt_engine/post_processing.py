@@ -6,7 +6,13 @@ from jsonschema import Draft202012Validator
 
 from .claude_auth import ClaudeCredentialRateLimited
 from .db import now_utc
-from .harnesses import RETRYABLE_RATE_LIMIT_FAILURES, HarnessError, normalize_harness_name, scan_model_provider
+from .harnesses import (
+    CAPACITY_RATE_LIMIT_FAILURES,
+    RETRYABLE_RATE_LIMIT_FAILURES,
+    HarnessError,
+    normalize_harness_name,
+    scan_model_provider,
+)
 from .model_output_artifacts import record_model_error_output
 from .prompting import (
     append_schema_prompt,
@@ -26,6 +32,7 @@ from .workspace import (
     mark_provider_account_available,
     mark_provider_account_rate_limited,
     prepare_dependency_workspace,
+    provider_account_lease,
     workspace_context,
     workspace_prompt_context,
 )
@@ -548,14 +555,19 @@ class PostProcessor:
                 codex_session_id = None
                 result = None
                 try:
-                    result = harness.run(
-                        prompt=final_prompt,
-                        schema=schema,
-                        repo_dir=prepared.repo_dir,
-                        model=scan["model"],
-                        thinking_effort=thinking_effort,
-                        env=prepared.workspace.env,
-                    )
+                    with provider_account_lease(
+                        getattr(prepared.workspace, "provider_account_provider", None),
+                        getattr(prepared.workspace, "provider_account_home", None),
+                        data_dir=getattr(self.config, "data_dir", None),
+                    ):
+                        result = harness.run(
+                            prompt=final_prompt,
+                            schema=schema,
+                            repo_dir=prepared.repo_dir,
+                            model=scan["model"],
+                            thinking_effort=thinking_effort,
+                            env=prepared.workspace.env,
+                        )
                     mark_provider_account_available(
                         getattr(prepared.workspace, "provider_account_provider", None),
                         getattr(prepared.workspace, "provider_account_home", None),
@@ -618,7 +630,7 @@ class PostProcessor:
                     if isinstance(exc, HarnessError) and (
                         exc.code in RETRYABLE_RATE_LIMIT_FAILURES or not exc.retryable
                     ):
-                        if exc.code in RETRYABLE_RATE_LIMIT_FAILURES and exc.code != "provider_throttled":
+                        if exc.code in RETRYABLE_RATE_LIMIT_FAILURES and exc.code not in CAPACITY_RATE_LIMIT_FAILURES:
                             mark_provider_account_rate_limited(
                                 getattr(prepared.workspace, "provider_account_provider", None),
                                 getattr(prepared.workspace, "provider_account_home", None),

@@ -1,7 +1,9 @@
 import json
 import shutil
 import subprocess
+import threading
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +60,7 @@ from open_kritt_engine.workspace import (
     prepare_dependency_workspace,
     prepare_job_workspace,
     prewarm_scan_checkout_cache,
+    provider_account_lease,
     provider_accounts_all_rate_limited,
     provider_home_for_job,
     restore_persistent_scan_checkout_cache,
@@ -870,6 +873,7 @@ def test_codex_harness_uses_dangerous_permissions_and_web_search(monkeypatch):
     assert result.payload == marked({"stub": True, "stub_explanation": "No matching records.", "results": []})
     assert captured["cmd"][:3] == ["codex", "--search", "exec"]
     assert "--dangerously-bypass-approvals-and-sandbox" in captured["cmd"]
+    assert "agents.max_concurrent_threads_per_session=5" in captured["cmd"]
     assert "--ephemeral" not in captured["cmd"]
     assert "--sandbox" not in captured["cmd"]
 
@@ -1104,6 +1108,7 @@ def test_codex_harness_resumes_corrupted_session_for_json(monkeypatch, tmp_path)
     assert result.usage["total_tokens"] == 7
     assert calls[1][:3] == ["codex", "exec", "resume"]
     assert calls[1][-2:] == ["session-bad", "-"]
+    assert "agents.max_concurrent_threads_per_session=5" in calls[1]
     assert 'model_provider="openrouter"' in calls[1]
     assert 'model_reasoning_effort="medium"' in calls[1]
     assert EXTRACTOR_HELPER_FIELD in prompts[1]
@@ -1474,6 +1479,11 @@ def test_harness_process_errors_do_not_echo_command_or_provider_output(monkeypat
             "provider_throttled",
             True,
         ),
+        (
+            '{"limit_id":"premium"}\nAgent errored: You\'ve hit your usage limit. Upgrade to Pro.',
+            "subagent_limited",
+            True,
+        ),
         ('{"error":"usage_limit"}', "account_quota_limited", True),
         ('{"error":"you have hit your limit"}', "account_quota_limited", True),
         ('{"api_error_status":403,"result":"Key limit exceeded (total limit)"}', "account_quota_limited", True),
@@ -1608,6 +1618,16 @@ def test_harness_rate_limit_error_carries_retry_after(monkeypatch):
     assert exc_info.value.retry_after_seconds == 12.5
 
 
+def test_harness_usage_limit_error_carries_natural_language_reset_time():
+    retry_at = datetime.now(timezone.utc) + timedelta(days=2)
+    formatted = retry_at.strftime("%b DAYth, %Y %I:%M %p").replace("DAY", str(retry_at.day))
+
+    retry_after = harnesses._retry_after_seconds(f"You've hit your usage limit; try again at {formatted}.")
+
+    assert retry_after is not None
+    assert 47 * 60 * 60 < retry_after <= 48 * 60 * 60
+
+
 def test_github_repo_url_normalizes_to_owner_repo():
     assert normalize_repo_full("https://github.com/anza-xyz/agave") == "anza-xyz/agave"
     assert normalize_repo_full("https://github.com/anza-xyz/agave.git") == "anza-xyz/agave"
@@ -1732,6 +1752,136 @@ def test_provider_rotation_skips_limited_accounts_until_all_are_limited(monkeypa
 
     mark_provider_account_available(provider, first)
     assert provider_home_for_job(provider, 5) == first
+
+
+def test_provider_rotation_prefers_live_available_account(monkeypatch, tmp_path):
+    monkeypatch.delenv("ENGINE_RUNTIME_CONFIG_PATH", raising=False)
+    home_a = tmp_path / "homes" / "limited-a"
+    home_b = tmp_path / "homes" / "limited-b"
+    home_c = tmp_path / "homes" / "available"
+    for home in (home_a, home_b, home_c):
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ENGINE_CODEX_HOME", f"{home_a},{home_b},{home_c}")
+    monkeypatch.setattr(
+        "open_kritt_engine.workspace._provider_account_health",
+        lambda provider: {
+            str(home_a): workspace_module._ProviderAccountHealth(False, 100),
+            str(home_b): workspace_module._ProviderAccountHealth(False, 100),
+            str(home_c): workspace_module._ProviderAccountHealth(True, 100),
+        },
+    )
+
+    assert provider_home_for_job("codex", 1) == str(home_c)
+    assert provider_home_for_job("codex", 2) == str(home_c)
+    assert not provider_accounts_all_rate_limited("codex")
+
+
+def test_provider_rotation_releases_stale_local_limit_after_newer_available_observation(monkeypatch, tmp_path):
+    monkeypatch.delenv("ENGINE_RUNTIME_CONFIG_PATH", raising=False)
+    home_a = tmp_path / "homes" / "recovered"
+    home_b = tmp_path / "homes" / "available"
+    for home in (home_a, home_b):
+        home.mkdir(parents=True)
+        (home / "auth.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("ENGINE_CODEX_HOME", f"{home_a},{home_b}")
+    observed_at = 99.0
+    monkeypatch.setattr(workspace_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(
+        workspace_module,
+        "_provider_account_health",
+        lambda provider: {
+            str(home_a): workspace_module._ProviderAccountHealth(True, observed_at),
+            str(home_b): workspace_module._ProviderAccountHealth(True, observed_at),
+        },
+    )
+
+    mark_provider_account_rate_limited("codex", str(home_a))
+
+    assert provider_home_for_job("codex", 1) == str(home_b)
+
+    observed_at = 101.0
+
+    assert {provider_home_for_job("codex", 2), provider_home_for_job("codex", 3)} == {
+        str(home_a),
+        str(home_b),
+    }
+
+
+def test_provider_health_timestamp_parses_account_service_observation():
+    observed_at = workspace_module._provider_health_timestamp("2026-07-26T08:45:09.977704Z")
+
+    assert observed_at == datetime(2026, 7, 26, 8, 45, 9, 977704, tzinfo=timezone.utc).timestamp()
+
+
+def test_provider_account_lease_reloads_worker_limit_live(monkeypatch, tmp_path):
+    monkeypatch.delenv("ENGINE_RUNTIME_CONFIG_PATH", raising=False)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    runtime_path = data_dir / "engine-runtime.env"
+    runtime_path.write_text("ENGINE_WORKERS_PER_ACCOUNT=1\n", encoding="utf-8")
+    home = str(tmp_path / "account" / ".codex")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first_call():
+        with provider_account_lease("codex", home, data_dir=str(data_dir)):
+            first_entered.set()
+            assert release_first.wait(2)
+
+    def second_call():
+        assert first_entered.wait(2)
+        with provider_account_lease("codex", home, data_dir=str(data_dir)):
+            second_entered.set()
+
+    first = threading.Thread(target=first_call)
+    second = threading.Thread(target=second_call)
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert not second_entered.wait(0.05)
+    runtime_path.write_text("ENGINE_WORKERS_PER_ACCOUNT=2\n", encoding="utf-8")
+    assert second_entered.wait(1.5)
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+
+def test_provider_account_lease_defaults_to_fifteen_parallel_root_calls(monkeypatch, tmp_path):
+    monkeypatch.delenv("ENGINE_WORKERS_PER_ACCOUNT", raising=False)
+    assert workspace_module._provider_account_worker_limit() == 15
+
+    home = str(tmp_path / "parallel-account" / ".codex")
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+
+    def first_call():
+        with provider_account_lease("codex", home):
+            first_entered.set()
+            assert release_first.wait(2)
+
+    def second_call():
+        assert first_entered.wait(2)
+        with provider_account_lease("codex", home):
+            second_entered.set()
+
+    first = threading.Thread(target=first_call)
+    second = threading.Thread(target=second_call)
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert second_entered.wait(0.5)
+    release_first.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
 
 
 def test_job_workspace_reloads_codex_homes_from_runtime_file(monkeypatch, tmp_path):
@@ -2224,6 +2374,7 @@ def test_worker_moves_finished_workflow_into_post_processing(monkeypatch, tmp_pa
     assert all(name == "codex" for name, _kwargs in harness_calls)
     assert all(kwargs["model_provider"] == "openrouter" for _name, kwargs in harness_calls)
     assert all(kwargs["codex_model_provider"] == "private-openrouter" for _name, kwargs in harness_calls)
+    assert all(kwargs["codex_max_subagents"] == 5 for _name, kwargs in harness_calls)
 
 
 def test_worker_retries_strict_validation_then_writes_results(monkeypatch, tmp_path):
