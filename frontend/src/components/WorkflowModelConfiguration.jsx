@@ -1,4 +1,9 @@
-import ModelConfiguration, { modelConfigurationForCatalog, modelConfigurationIsValid } from './ModelConfiguration.jsx';
+import ModelConfiguration, {
+  THINKING_EFFORTS,
+  modelConfigurationForCatalog,
+  modelConfigurationIsValid,
+} from './ModelConfiguration.jsx';
+import { thinkingEffortForModelChange, thinkingEffortsForModel } from '../lib/modelProviders.js';
 import {
   enableModelOverrides,
   modelOverridesDraft,
@@ -9,8 +14,19 @@ import {
 
 export function workflowModelConfigurationForCatalog(current, providers, catalog) {
   const base = modelConfigurationForCatalog(current, providers, catalog);
+  const postProcessingEfforts = thinkingEffortsForModel(
+    catalog,
+    base.model_provider,
+    base.model,
+    THINKING_EFFORTS,
+    base.harness
+  );
   return {
     ...base,
+    post_processing_thinking_effort: thinkingEffortForModelChange(
+      current?.post_processing_thinking_effort ?? current?.postProcessingThinkingEffort ?? base.thinking_effort,
+      postProcessingEfforts
+    ),
     model_overrides: normalizeModelOverrides(current?.model_overrides ?? current?.modelOverrides, (configuration) =>
       modelConfigurationForCatalog(configuration, providers, catalog)
     ),
@@ -19,6 +35,16 @@ export function workflowModelConfigurationForCatalog(current, providers, catalog
 
 export function workflowModelConfigurationIsValid(value, depths, providers, catalog) {
   if (!modelConfigurationIsValid(value, providers, catalog)) return false;
+  const postProcessingEfforts = thinkingEffortsForModel(
+    catalog,
+    value.model_provider,
+    value.model,
+    THINKING_EFFORTS,
+    value.harness
+  );
+  const postProcessingThinkingEffort =
+    value?.post_processing_thinking_effort ?? value?.postProcessingThinkingEffort ?? value?.thinking_effort;
+  if (!postProcessingEfforts.includes(postProcessingThinkingEffort)) return false;
   const overrides = modelOverridesDraft(value?.model_overrides ?? value?.modelOverrides);
   const allowedDepths = new Set(depths.map(String));
   if (Object.keys(overrides).some((depth) => !allowedDepths.has(depth))) return false;
@@ -55,6 +81,15 @@ export default function WorkflowModelConfiguration({
   const customized = Object.keys(overrides).length > 0;
   const canCustomize = depths.length > 0;
   const depthLabels = new Map(depthChips.map((chip) => [chip.depth, chip]));
+  const postProcessingEfforts = thinkingEffortsForModel(
+    catalog,
+    value.model_provider,
+    value.model,
+    THINKING_EFFORTS,
+    value.harness
+  );
+  const postProcessingThinkingEffort =
+    value?.post_processing_thinking_effort ?? value?.postProcessingThinkingEffort ?? value?.thinking_effort;
 
   const useSingleModel = () => onChange({ ...value, model_overrides: {} });
   const customizeByDepth = () =>
@@ -100,7 +135,7 @@ export default function WorkflowModelConfiguration({
       >
         {customized && (
           <div className="mono" style={{ fontSize: 10.5, color: 'var(--text-3)', marginBottom: 9 }}>
-            DEFAULT &amp; POST-PROCESSING
+            DEFAULT WORKFLOW MODEL
           </div>
         )}
         <ModelConfiguration
@@ -112,6 +147,43 @@ export default function WorkflowModelConfiguration({
           disabled={disabled}
         />
       </div>
+
+      <label
+        style={{
+          display: 'block',
+          maxWidth: 280,
+          marginTop: 12,
+          border: '1px solid var(--border)',
+          borderRadius: 9,
+          padding: 13,
+          background: 'var(--surface-2)',
+        }}
+      >
+        <span className="mono" style={{ display: 'block', fontSize: 10.5, color: 'var(--text-3)', marginBottom: 7 }}>
+          POST-PROCESSING THINKING EFFORT
+        </span>
+        <select
+          className="mono"
+          value={postProcessingThinkingEffort}
+          disabled={disabled || postProcessingEfforts.length === 0}
+          onChange={(event) => onChange({ ...value, post_processing_thinking_effort: event.target.value })}
+          style={{
+            width: '100%',
+            height: 36,
+            padding: '0 10px',
+            borderRadius: 7,
+            border: '1px solid var(--border)',
+            background: 'var(--surface)',
+            color: 'var(--text)',
+          }}
+        >
+          {postProcessingEfforts.map((effort) => (
+            <option key={effort} value={effort}>
+              {effort}
+            </option>
+          ))}
+        </select>
+      </label>
 
       {customized && (
         <div style={{ display: 'grid', gap: 12, marginTop: 12 }}>

@@ -903,7 +903,13 @@ class Database:
         post_script_name: str | None = None,
         vulnerability_id: int | None = None,
     ) -> int | None:
-        lock_key = f"post-process:{scan_id}:{kind}:{batch_index or 0}:{post_script_id or 0}:{vulnerability_id or 0}"
+        # Batch indexes are chosen before this transaction. Lock batch pipelines by
+        # logical kind so two workers cannot turn the same snapshot into different
+        # batch indexes; post-script jobs remain independently claimable.
+        if kind == "post_script":
+            lock_key = f"post-process:{scan_id}:{kind}:{post_script_id or 0}:{vulnerability_id or 0}"
+        else:
+            lock_key = f"post-process:{scan_id}:{kind}"
         conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,))
         scan = conn.execute(
             """
@@ -932,20 +938,44 @@ class Database:
                 (scan_id, kind, vulnerability_id, post_script_id),
             ).fetchone()
         else:
+            # The scan row lock serializes this recheck with every other claim.
             existing = conn.execute(
                 """
                 SELECT id
                 FROM workflows.post_process_metadata
                 WHERE scan_id = %s
                   AND kind = %s
-                  AND batch_index = %s
-                  AND status IN ('running', 'completed')
+                  AND (
+                      status = 'running'
+                      OR (batch_index = %s AND status = 'completed')
+                  )
                 LIMIT 1
                 """,
                 (scan_id, kind, batch_index),
             ).fetchone()
         if existing:
             return None
+        expected_target_ids = sorted(set(target_vulnerability_ids))
+        if kind in {"dedupe", "ranker"}:
+            if not expected_target_ids:
+                return None
+            target_state = (
+                "dedupe_is_canonical IS NULL"
+                if kind == "dedupe"
+                else "dedupe_is_canonical = true AND bounty_rank IS NULL"
+            )
+            eligible = conn.execute(
+                f"""
+                SELECT count(*) AS count
+                FROM workflows.vulnerabilities
+                WHERE scan_id = %s
+                  AND id = ANY(%s::bigint[])
+                  AND {target_state}
+                """,
+                (scan_id, expected_target_ids),
+            ).fetchone()
+            if int(eligible["count"]) != len(expected_target_ids):
+                return None
         previous = conn.execute(
             """
             SELECT id

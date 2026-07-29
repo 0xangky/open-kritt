@@ -15,6 +15,7 @@ RUNTIME_ENV_ALIASES = {
     "ENGINE_CODEX_HOME": ("ENGINE_CODEX_HOME", "CODEX_HOME"),
     "ENGINE_CLAUDE_HOME": ("ENGINE_CLAUDE_HOME", "CLAUDE_HOME"),
     "ENGINE_WORKSPACE_SETUP_CONCURRENCY": ("ENGINE_WORKSPACE_SETUP_CONCURRENCY",),
+    "ENGINE_POST_PROCESS_WORKSPACE_MODE": ("ENGINE_POST_PROCESS_WORKSPACE_MODE",),
     "ENGINE_RETRY_COUNT": ("ENGINE_RETRY_COUNT",),
     "ENGINE_HARNESS_TIMEOUT_SECONDS": ("ENGINE_HARNESS_TIMEOUT_SECONDS",),
 }
@@ -48,6 +49,7 @@ def ensure_runtime_config_file(data_dir: str | None = None) -> Path:
         "ENGINE_CODEX_HOME": os.getenv("ENGINE_CODEX_HOME") or os.getenv("CODEX_HOME") or "/root/.codex",
         "ENGINE_CLAUDE_HOME": os.getenv("ENGINE_CLAUDE_HOME") or os.getenv("CLAUDE_HOME") or "/root/.claude",
         "ENGINE_WORKSPACE_SETUP_CONCURRENCY": os.getenv("ENGINE_WORKSPACE_SETUP_CONCURRENCY") or "2",
+        "ENGINE_POST_PROCESS_WORKSPACE_MODE": os.getenv("ENGINE_POST_PROCESS_WORKSPACE_MODE") or "copy",
         "ENGINE_RETRY_COUNT": os.getenv("ENGINE_RETRY_COUNT") or "2",
         "ENGINE_HARNESS_TIMEOUT_SECONDS": os.getenv("ENGINE_HARNESS_TIMEOUT_SECONDS") or "7200",
     }
@@ -56,7 +58,7 @@ def ensure_runtime_config_file(data_dir: str | None = None) -> Path:
         "# open-kritt live engine runtime config",
         "# Edit this file while the engine is running to change future job pickup.",
         "# Explicit environment values are synced here once at each engine startup.",
-        "# Existing Codex calls keep their current account until they finish.",
+        "# Existing provider calls keep their current account until they finish.",
         "# ENGINE_WORKER_COUNT=0 pauses new job pickup without killing running jobs.",
         "# ENGINE_MAX_CONCURRENT_SCANS caps immediate scans; queued work waits for an empty active pool.",
         "# ENGINE_MAX_WORKERS_PER_SCAN=0 shares workers evenly; a positive value adds a hard per-scan cap.",
@@ -67,8 +69,9 @@ def ensure_runtime_config_file(data_dir: str | None = None) -> Path:
         "# ENGINE_IGNORE_LOW_STORAGE disables that safety floor and can allow the host disk to fill.",
         "# ENGINE_RETRY_COUNT and ENGINE_HARNESS_TIMEOUT_SECONDS apply to future model calls.",
         "# ENGINE_WORKSPACE_SETUP_CONCURRENCY requires an engine recreation to take effect.",
-        "# ENGINE_CODEX_HOME is the Codex home copied into future job workspaces.",
-        "# ENGINE_CLAUDE_HOME is the Claude home copied into future job workspaces.",
+        "# ENGINE_POST_PROCESS_WORKSPACE_MODE=image uses immutable Docker snapshots for workflow and post-processing jobs.",
+        "# Accounts updates ENGINE_CODEX_HOME and ENGINE_CLAUDE_HOME live; no engine restart is required.",
+        "# Each list controls the provider homes copied into future job workspaces.",
         "",
     ]
     lines.extend(f"{key}={_quote_env_value(value)}" for key, value in values.items())

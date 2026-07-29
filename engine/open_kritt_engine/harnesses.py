@@ -786,7 +786,13 @@ def _container_path(value: str, *, repo_dir: str, home: str) -> str:
     return value
 
 
-def _scan_docker_command(cmd: list[str], repo_dir: str, env: dict[str, str]) -> list[str]:
+def _scan_docker_command(
+    cmd: list[str],
+    repo_dir: str,
+    env: dict[str, str],
+    *,
+    runner_image: str | None = None,
+) -> list[str]:
     """Run a tool-enabled harness in a per-job network and mount namespace."""
 
     docker = shutil.which(os.getenv("ENGINE_DOCKER_BIN", "docker"))
@@ -799,9 +805,9 @@ def _scan_docker_command(cmd: list[str], repo_dir: str, env: dict[str, str]) -> 
     if not home:
         raise HarnessError("Isolated scan runner requires HOME in the job environment", code="configuration_error")
 
-    workspace_host = _host_path_for_engine_data_path(repo_dir)
     home_host = _host_path_for_engine_data_path(home)
-    image = os.getenv("ENGINE_SCAN_RUNNER_IMAGE", "open-kritt-engine:local")
+    workspace_host = None if runner_image else _host_path_for_engine_data_path(repo_dir)
+    image = runner_image or os.getenv("ENGINE_SCAN_RUNNER_IMAGE", "open-kritt-engine:local")
     user = "0:0"
     container_name = _docker_container_name(repo_dir)
     network = f"{SCAN_SANDBOX_NETWORK_PREFIX}{container_name.removeprefix('open-kritt-scan-')}"[:63].rstrip("-.")
@@ -837,8 +843,6 @@ def _scan_docker_command(cmd: list[str], repo_dir: str, env: dict[str, str]) -> 
         "NODE_EXTRA_CA_CERTS",
     ]
 
-    workspace_mount = f"type=bind,src={workspace_host},dst={CLAUDE_RUNNER_WORKDIR}"
-
     docker_cmd = [
         docker,
         "run",
@@ -859,13 +863,22 @@ def _scan_docker_command(cmd: list[str], repo_dir: str, env: dict[str, str]) -> 
         CLAUDE_RUNNER_WORKDIR,
         "--pids-limit",
         "512",
-        "--mount",
-        workspace_mount,
-        "--mount",
-        f"type=bind,src={home_host},dst={CLAUDE_RUNNER_HOME}",
-        "--tmpfs",
-        "/tmp:rw,nosuid,nodev,size=1g",
     ]
+    if workspace_host is not None:
+        docker_cmd.extend(
+            [
+                "--mount",
+                f"type=bind,src={workspace_host},dst={CLAUDE_RUNNER_WORKDIR}",
+            ]
+        )
+    docker_cmd.extend(
+        [
+            "--mount",
+            f"type=bind,src={home_host},dst={CLAUDE_RUNNER_HOME}",
+            "--tmpfs",
+            "/tmp:rw,nosuid,nodev,size=1g",
+        ]
+    )
     for key, value in container_env.items():
         docker_cmd.extend(["--env", f"{key}={value}"])
     for key in inherited_env:
@@ -1418,10 +1431,11 @@ class CodexHarness:
         thinking_effort: str | None = None,
         env: dict[str, str] | None = None,
         allow_tools: bool = True,
+        runner_image: str | None = None,
     ) -> HarnessResult:
         usage = self.cli_gate.use() if self.cli_gate is not None else nullcontext()
         with usage:
-            return self._run(prompt, schema, repo_dir, model, thinking_effort, env, allow_tools)
+            return self._run(prompt, schema, repo_dir, model, thinking_effort, env, allow_tools, runner_image)
 
     def _run(
         self,
@@ -1432,6 +1446,7 @@ class CodexHarness:
         thinking_effort: str | None,
         env: dict[str, str] | None,
         allow_tools: bool,
+        runner_image: str | None,
     ) -> HarnessResult:
         actual_env = env if env is not None else _base_env()
         temp_parent = actual_env.get("HOME")
@@ -1455,7 +1470,11 @@ class CodexHarness:
                 max_subagents=self.max_subagents if allow_tools else None,
             )
             if allow_tools:
-                cmd = _scan_docker_command(cmd, repo_dir, actual_env)
+                cmd = (
+                    _scan_docker_command(cmd, repo_dir, actual_env, runner_image=runner_image)
+                    if runner_image
+                    else _scan_docker_command(cmd, repo_dir, actual_env)
+                )
             started_at = time.time()
             proc = _run_process(cmd, prompt, repo_dir, self.timeout_seconds, env=actual_env)
             output_files = {}
@@ -1493,6 +1512,7 @@ class CodexHarness:
                             model=model,
                             thinking_effort=thinking_effort,
                             env=actual_env,
+                            runner_image=runner_image,
                         )
                         parsed_payload = resume_result.payload
                         usage = resume_result.usage or usage
@@ -1540,6 +1560,7 @@ class CodexHarness:
         model: str,
         thinking_effort: str | None,
         env: dict[str, str],
+        runner_image: str | None = None,
     ) -> HarnessResult:
         cmd = [
             "codex",
@@ -1564,7 +1585,11 @@ class CodexHarness:
         if thinking_effort and thinking_effort != "default":
             cmd.extend(["-c", f'model_reasoning_effort="{thinking_effort}"'])
         cmd.extend([session_id, "-"])
-        cmd = _scan_docker_command(cmd, repo_dir, env)
+        cmd = (
+            _scan_docker_command(cmd, repo_dir, env, runner_image=runner_image)
+            if runner_image
+            else _scan_docker_command(cmd, repo_dir, env)
+        )
         started_at = time.time()
         proc = _run_process(cmd, _resume_json_prompt(schema), repo_dir, self.timeout_seconds, env=env)
         output_files = {}
@@ -1623,6 +1648,7 @@ class ClaudeHarness:
         thinking_effort: str | None = None,
         env: dict[str, str] | None = None,
         allow_tools: bool = True,
+        runner_image: str | None = None,
     ) -> HarnessResult:
         base_env = env if env is not None else _base_env()
         provider = claude_model_provider(model, base_env, self.model_provider)
@@ -1654,7 +1680,15 @@ class ClaudeHarness:
             cmd.extend(["--include-partial-messages", "--verbose"])
         if thinking_effort and thinking_effort != "default":
             cmd.extend(["--effort", thinking_effort])
-        run_cmd = _scan_docker_command(cmd, repo_dir, actual_env) if allow_tools else cmd
+        run_cmd = (
+            (
+                _scan_docker_command(cmd, repo_dir, actual_env, runner_image=runner_image)
+                if runner_image
+                else _scan_docker_command(cmd, repo_dir, actual_env)
+            )
+            if allow_tools
+            else cmd
+        )
         timeout_seconds = self.timeout_seconds
         if provider != "openrouter":
             timeout_seconds = claude_oauth_timeout_seconds(
@@ -1749,6 +1783,7 @@ class CursorHarness:
         thinking_effort: str | None = None,
         env: dict[str, str] | None = None,
         allow_tools: bool = True,
+        runner_image: str | None = None,
     ) -> HarnessResult:
         if not allow_tools:
             raise HarnessError(
@@ -1774,7 +1809,11 @@ class CursorHarness:
             repo_dir,
             "Read the full task from standard input, complete it in this workspace, and return only the requested structured JSON.",
         ]
-        cmd = _scan_docker_command(cmd, repo_dir, actual_env)
+        cmd = (
+            _scan_docker_command(cmd, repo_dir, actual_env, runner_image=runner_image)
+            if runner_image
+            else _scan_docker_command(cmd, repo_dir, actual_env)
+        )
         proc = _run_process(cmd, prompt, repo_dir, self.timeout_seconds, env=actual_env)
         process_output = _process_output(proc)
         try:

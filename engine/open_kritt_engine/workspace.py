@@ -31,6 +31,10 @@ from .repository import (
     snapshot_local_repo,
 )
 from .runtime_config import runtime_int, runtime_value
+from .workspace_snapshots import (
+    WorkspaceSnapshotError,
+    ensure_workspace_snapshot_image,
+)
 
 _PROVIDER_HOME_LOCK = threading.Lock()
 _PROVIDER_HOME_CURSORS: dict[str, int] = {}
@@ -52,6 +56,7 @@ JOB_UID_BASE = 100_000
 JOB_UID_SPAN = 2_000_000_000
 _SHARED_WORKSPACE_LOCKS: dict[str, threading.Lock] = {}
 _SHARED_WORKSPACE_LOCKS_GUARD = threading.Lock()
+IMAGE_WORKSPACE_MODES = {"image", "snapshot", "snapshot_image"}
 
 
 @dataclass(frozen=True)
@@ -62,8 +67,12 @@ class JobWorkspace:
     codex_source_home: str | None = None
     codex_account_id: str | None = None
     codex_account_email: str | None = None
+    # Provider-neutral identity is written through the database's legacy
+    # codex_account_* attribution columns until that schema is generalized.
     provider_account_provider: str | None = None
     provider_account_home: str | None = None
+    provider_account_id: str | None = None
+    provider_account_email: str | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +84,8 @@ class DependencyWorkspace:
     layout: str
     manifest_json: str
     setup_timings_ms: dict[str, int] | None = None
+    source_repo_dir: str | None = None
+    runner_image: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +107,15 @@ class _ProviderAccountGate:
 class _ProviderAccountHealth:
     available: bool
     observed_at: float | None
+
+
+def image_workspace_enabled(*, data_dir: str | None = None) -> bool:
+    mode = runtime_value(
+        "ENGINE_POST_PROCESS_WORKSPACE_MODE",
+        "copy",
+        data_dir=data_dir,
+    )
+    return str(mode or "copy").strip().lower() in IMAGE_WORKSPACE_MODES
 
 
 def prepare_job_workspace(
@@ -135,7 +155,13 @@ def prepare_job_workspace(
         if needs_claude_home and selected_provider == "claude"
         else None
     )
-    codex_account = _codex_account_info(codex_source) if codex_source else {}
+    provider_account = (
+        _codex_account_info(codex_source)
+        if codex_source
+        else _claude_account_info(claude_source)
+        if claude_source
+        else {}
+    )
     if needs_codex_home and codex_source:
         _copy_credential_files(Path(codex_source), codex_home, ("auth.json",))
     elif needs_codex_home:
@@ -180,10 +206,12 @@ def prepare_job_workspace(
         repo_base_dir=str(repo_base),
         env=env,
         codex_source_home=codex_source,
-        codex_account_id=codex_account.get("id"),
-        codex_account_email=codex_account.get("email"),
+        codex_account_id=provider_account.get("id") if codex_source else None,
+        codex_account_email=provider_account.get("email") if codex_source else None,
         provider_account_provider=selected_provider if selected_provider in {"codex", "claude"} else None,
         provider_account_home=codex_source or claude_source,
+        provider_account_id=provider_account.get("id"),
+        provider_account_email=provider_account.get("email"),
     )
 
 
@@ -311,6 +339,7 @@ def prepare_dependency_workspace(
     agent_skills: list[dict[str, Any]] | None = None,
     harness_name: str | None = None,
     model_provider: str | None = None,
+    use_snapshot_image: bool = False,
 ) -> DependencyWorkspace:
     scan = resolve_scan_checkout_revisions(scan, github_token=github_token, data_dir=data_dir)
     total_started = time.perf_counter()
@@ -324,6 +353,42 @@ def prepare_dependency_workspace(
         model_provider=model_provider,
     )
     timings["job_home_ms"] = _elapsed_ms(home_started)
+    if use_snapshot_image:
+        try:
+            prepared = _prepare_dependency_snapshot_workspace(
+                workspace=workspace,
+                cache_dir=_checkout_cache_dir(checkout_cache_dir),
+                scan=scan,
+                github_token=github_token,
+                timings=timings,
+            )
+            timings["total_ms"] = _elapsed_ms(total_started)
+            LOGGER.info(
+                "prepared image workspace for metadata %s scan %s in %sms using %s: %s",
+                metadata_id,
+                scan.get("id"),
+                timings["total_ms"],
+                prepared.runner_image,
+                timings,
+            )
+            return DependencyWorkspace(
+                workspace=prepared.workspace,
+                repo_dir=prepared.repo_dir,
+                checked_out_commit=prepared.checked_out_commit,
+                manifest=prepared.manifest,
+                layout=prepared.layout,
+                manifest_json=prepared.manifest_json,
+                setup_timings_ms=timings,
+                source_repo_dir=prepared.source_repo_dir,
+                runner_image=prepared.runner_image,
+            )
+        except WorkspaceSnapshotError as exc:
+            LOGGER.warning(
+                "workspace snapshot unavailable for metadata %s scan %s; falling back to a physical copy: %s",
+                metadata_id,
+                scan.get("id"),
+                exc,
+            )
     # Every harness gets a writable per-job copy. The nested runner is disposable,
     # so agents can compile targets and create proof-of-concept artifacts freely.
     cache_dir = _checkout_cache_dir(checkout_cache_dir)
@@ -358,6 +423,103 @@ def prepare_dependency_workspace(
         layout=prepared_tree.layout,
         manifest_json=prepared_tree.manifest_json,
         setup_timings_ms=timings,
+    )
+
+
+def _prepare_dependency_snapshot_workspace(
+    *,
+    workspace: JobWorkspace,
+    cache_dir: Path,
+    scan: dict[str, Any],
+    github_token: str | None,
+    timings: dict[str, int] | None = None,
+) -> DependencyWorkspace:
+    primary_kind = scan.get("repo_kind") or "remote"
+    requested_commit = _requested_revision(primary_kind, scan.get("commit_sha"))
+    cache_started = time.perf_counter()
+    primary_cache_checkout, checked_out_commit = _checkout_scan_repo_to_cache(
+        cache_dir=cache_dir,
+        kind=primary_kind,
+        repo_full=scan["repo_full"],
+        commit_sha=requested_commit,
+        github_token=github_token,
+        scan_id=scan.get("id"),
+    )
+    _add_timing(timings, "checkout_cache_ms", _elapsed_ms(cache_started))
+
+    sources = [(primary_cache_checkout, SCAN_RUNNER_WORKDIR)]
+    dependencies = []
+    used_aliases: set[str] = set(RESERVED_WORKSPACE_ENTRIES)
+    for dep in _scan_dependencies(scan):
+        kind = dep.get("kind") or "remote"
+        repo_full = dep.get("repo_full") or dep.get("repoFull") or ""
+        commit_sha = _requested_revision(kind, dep.get("commit_sha") or dep.get("commitSha"))
+        if not repo_full:
+            continue
+        alias = _dependency_alias(SCAN_RUNNER_WORKDIR, repo_full, used_aliases)
+        used_aliases.add(alias)
+        cache_started = time.perf_counter()
+        dep_cache_checkout, dep_commit = _checkout_scan_repo_to_cache(
+            cache_dir=cache_dir,
+            kind=kind,
+            repo_full=repo_full,
+            commit_sha=commit_sha,
+            github_token=github_token,
+            scan_id=scan.get("id"),
+        )
+        _add_timing(timings, "checkout_cache_ms", _elapsed_ms(cache_started))
+        dependency_path = f"{SCAN_RUNNER_WORKDIR}/{alias}"
+        sources.append((dep_cache_checkout, dependency_path))
+        dependencies.append(
+            {
+                "kind": kind,
+                "repo": repo_full,
+                "requested_commit": commit_sha,
+                "commit": dep_commit,
+                "alias": alias,
+                "path": dependency_path,
+                "relative_path": alias,
+            }
+        )
+
+    manifest = {
+        "primary": {
+            "kind": primary_kind,
+            "repo": scan["repo_full"],
+            "requested_commit": requested_commit,
+            "commit": checked_out_commit,
+            "path": SCAN_RUNNER_WORKDIR,
+        },
+        "dependencies": dependencies,
+    }
+    manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True)
+    layout = workspace_layout(SCAN_RUNNER_WORKDIR, manifest)
+    repo_dir = Path(workspace.root_dir) / "workspace"
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    _write_workspace_files(str(repo_dir), manifest, layout, manifest_json)
+
+    image_started = time.perf_counter()
+    runner_image = ensure_workspace_snapshot_image(
+        base_image=os.getenv("ENGINE_SCAN_RUNNER_IMAGE", "open-kritt-engine:local"),
+        checkout_key=scan_checkout_cache_key(scan),
+        manifest_json=manifest_json,
+        workspace_files_dir=str(repo_dir),
+        sources=sources,
+        scan_id=scan.get("id"),
+    )
+    _add_timing(timings, "snapshot_image_ms", _elapsed_ms(image_started))
+    job_uid = int(workspace.env["OPEN_KRITT_JOB_UID"])
+    job_gid = int(workspace.env["OPEN_KRITT_JOB_GID"])
+    _secure_job_tree(Path(workspace.root_dir), job_uid, job_gid)
+    return DependencyWorkspace(
+        workspace=workspace,
+        repo_dir=str(repo_dir),
+        checked_out_commit=checked_out_commit,
+        manifest=manifest,
+        layout=layout,
+        manifest_json=manifest_json,
+        source_repo_dir=primary_cache_checkout,
+        runner_image=runner_image,
     )
 
 
@@ -1483,6 +1645,55 @@ def _codex_account_info(home: str) -> dict[str, str | None]:
     email = payload.get("email")
     return {
         "id": auth_info.get("chatgpt_account_id") or payload.get("sub") or email or str(home),
+        "email": email,
+    }
+
+
+def _first_account_profile_value(value: Any, keys: set[str]) -> str | None:
+    if not isinstance(value, dict | list):
+        return None
+    values = value.values() if isinstance(value, dict) else value
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            normalized_key = "".join(character for character in key.lower() if character.isalnum())
+            if normalized_key in keys and isinstance(candidate, str | int):
+                text = str(candidate).strip()
+                if text:
+                    return text
+    for candidate in values:
+        found = _first_account_profile_value(candidate, keys)
+        if found:
+            return found
+    return None
+
+
+def _claude_account_info(home: str) -> dict[str, str | None]:
+    source = Path(home)
+    candidates = [
+        source / ".open-kritt-account.json",
+        source / ".claude.json",
+        source / "claude.json",
+    ]
+    if source.name == ".claude":
+        candidates.append(source.parent / ".claude.json")
+    payloads: list[Any] = []
+    for path in candidates:
+        try:
+            if path.stat().st_size > 1024 * 1024:
+                continue
+            payloads.append(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError):
+            continue
+    email = _first_account_profile_value(
+        payloads,
+        {"email", "emailaddress", "useremail", "accountemail"},
+    )
+    account_id = _first_account_profile_value(
+        payloads,
+        {"accountid", "accountuuid", "userid", "useruuid"},
+    )
+    return {
+        "id": account_id or email or str(home),
         "email": email,
     }
 

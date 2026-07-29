@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { renewClaudeCredential } from './claudeCredentials.js';
 import { providerCredentialStatuses } from './providerCredentials.js';
-import { CLAUDE_HOME } from './providerLogins.js';
+import { CLAUDE_ACCOUNTS_ROOT, CLAUDE_HOME } from './providerLogins.js';
 
 const EXECUTOR_VIEW_URL = process.env.EXECUTOR_VIEW_URL || 'http://executor-view:8090';
 const EXECUTOR_VIEW_INTERNAL_TOKEN_FILE =
@@ -10,6 +11,7 @@ const EXECUTOR_VIEW_INTERNAL_TOKEN_FILE =
 const ACCOUNT_PROVIDER_IDS = ['codex', 'claude', 'openrouter'];
 const EXECUTOR_ACCOUNT_TIMEOUT_MS = 180000;
 const ACCOUNT_STATUS_KINDS = new Set(['available', 'limited', 'stale', 'expired', 'warning', 'missing']);
+const ACCOUNT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
 function safeText(value, limit = 500) {
   return typeof value === 'string' ? value.slice(0, limit) : null;
@@ -151,6 +153,7 @@ export async function fetchExecutorProvider(
     internalTokenFile,
     timeoutMs = EXECUTOR_ACCOUNT_TIMEOUT_MS,
     claudeHome = CLAUDE_HOME,
+    claudeAccountsRoot = CLAUDE_ACCOUNTS_ROOT,
     renewClaudeLogin = renewClaudeCredential,
   } = {}
 ) {
@@ -176,10 +179,21 @@ export async function fetchExecutorProvider(
       providerId === 'claude' && refresh && provider?.accounts?.some((account) => account?.statusKind === 'expired');
     if (claudeLoginRejected) {
       let renewed = false;
-      try {
-        renewed = await renewClaudeLogin(claudeHome);
-      } catch {
-        // Preserve the sanitized sign-in response when local renewal cannot run.
+      const homes = new Set(
+        provider.accounts
+          .filter((account) => account?.statusKind === 'expired')
+          .map((account) => {
+            if (!account?.id || account.id === 'default') return claudeHome;
+            return ACCOUNT_ID_PATTERN.test(account?.id || '') ? join(claudeAccountsRoot, account.id, '.claude') : null;
+          })
+          .filter(Boolean)
+      );
+      for (const home of homes) {
+        try {
+          renewed = (await renewClaudeLogin(home)) || renewed;
+        } catch {
+          // Preserve the sanitized sign-in response when local renewal cannot run.
+        }
       }
       if (renewed) provider = await requestProvider();
     }
@@ -195,6 +209,7 @@ export async function fetchExecutorAccounts({
   internalToken,
   internalTokenFile,
   claudeHome,
+  claudeAccountsRoot,
   renewClaudeLogin,
 } = {}) {
   const providers = await Promise.all(
@@ -205,6 +220,7 @@ export async function fetchExecutorAccounts({
         internalToken,
         internalTokenFile,
         claudeHome,
+        claudeAccountsRoot,
         renewClaudeLogin,
       })
     )

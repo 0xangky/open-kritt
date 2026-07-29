@@ -1,5 +1,4 @@
 import logging
-import math
 import random
 import shutil
 import threading
@@ -47,6 +46,7 @@ from .storage_cleanup import prune_docker_build_cache, prune_stopped_scan_contai
 from .workspace import (
     cleanup_job_workspace,
     cleanup_workspace,
+    image_workspace_enabled,
     mark_provider_account_available,
     mark_provider_account_rate_limited,
     prepare_dependency_workspace,
@@ -62,6 +62,7 @@ from .workspace import (
     workspace_context,
     workspace_prompt_context,
 )
+from .workspace_snapshots import cleanup_stale_workspace_snapshot_builders
 
 LOGGER = logging.getLogger("open_kritt_engine")
 NON_RUNNABLE_SCAN_STATUSES = {"queued", "pending", "rate_limited", "paused", "stopped", "failed", "completed"}
@@ -151,9 +152,13 @@ class Worker:
     def __init__(self, config: EngineConfig, db: Database | None = None):
         self.config = config
         self.db = db or Database(config.database_url)
-        self.post_processor = PostProcessor(config, self.db)
         setup_concurrency = max(1, int(getattr(config, "workspace_setup_concurrency", 1)))
         self.workspace_setup_slots = threading.BoundedSemaphore(setup_concurrency)
+        self.post_processor = PostProcessor(
+            config,
+            self.db,
+            workspace_setup_slots=self.workspace_setup_slots,
+        )
         self._prewarm_lock = threading.Lock()
         self._prewarmed_scan_cache_keys: set[tuple[int, str]] = set()
         self._prewarm_events: dict[tuple[int, str], threading.Event] = {}
@@ -161,6 +166,7 @@ class Worker:
         self._scan_scheduler_lock = threading.Lock()
         self._scan_allocations: dict[int, int] = {}
         self._scan_last_dispatch: dict[int, int] = {}
+        self._scan_no_work_until: dict[int, float] = {}
         self._scan_dispatch_sequence = 0
         self.codex_cli_gate = CodexCliGate()
         self.generation_runner = GenerationRunner(config, codex_cli_gate=self.codex_cli_gate)
@@ -198,6 +204,7 @@ class Worker:
         last_desired: int | None = None
         LOGGER.info("open-kritt engine started; live config: %s", runtime_config_path(self.config.data_dir))
         cleanup_stale_scan_sandboxes()
+        cleanup_stale_workspace_snapshot_builders()
         if hasattr(self.db, "connect"):
             self.recover_orphaned_metadata(now_utc())
             try:
@@ -762,6 +769,7 @@ class Worker:
                     self.db.set_scan_status_if_active(conn, int(scan["id"]), "failed", error=str(exc))
                     conn.commit()
                 return True
+            self._record_scan_claim_result(int(scan["id"]), did_work=did_work)
             if did_work:
                 LOGGER.info("worker %s made progress on scan %s (%s)", worker_id, scan["id"], scan["repo_full"])
             return did_work
@@ -823,8 +831,17 @@ class Worker:
             self._scan_scheduler_lock = threading.Lock()
             self._scan_allocations = {}
             self._scan_last_dispatch = {}
+            self._scan_no_work_until = {}
             self._scan_dispatch_sequence = 0
         return self._scan_scheduler_lock
+
+    def _record_scan_claim_result(self, scan_id: int, *, did_work: bool) -> None:
+        with self._scheduler_state():
+            if did_work:
+                self._scan_no_work_until.pop(scan_id, None)
+                return
+            retry_seconds = max(0.01, float(getattr(self.config, "poll_seconds", 5.0) or 5.0))
+            self._scan_no_work_until[scan_id] = time.monotonic() + retry_seconds
 
     def _reserve_scan(self) -> dict[str, Any] | None:
         with self._scheduler_state():
@@ -848,10 +865,15 @@ class Worker:
             self._scan_last_dispatch = {
                 scan_id: sequence for scan_id, sequence in self._scan_last_dispatch.items() if scan_id in active_ids
             }
+            self._scan_no_work_until = {
+                scan_id: retry_at for scan_id, retry_at in self._scan_no_work_until.items() if scan_id in active_ids
+            }
 
-            fair_cap = max(1, math.ceil(self.runtime_worker_count() / len(scans)))
+            worker_limit = max(1, self.runtime_worker_count())
+            if sum(self._scan_allocations.values()) >= worker_limit:
+                return None
             configured_cap = self.runtime_max_workers_per_scan()
-            default_scan_cap = min(fair_cap, configured_cap) if configured_cap > 0 else fair_cap
+            default_scan_cap = min(worker_limit, configured_cap) if configured_cap > 0 else worker_limit
 
             def scan_cap(scan: dict[str, Any]) -> int:
                 reasoning = scan.get("reasoning")
@@ -860,7 +882,13 @@ class Worker:
                     return min(default_scan_cap, adaptive_cap)
                 return default_scan_cap
 
-            eligible = [scan for scan in scans if self._scan_allocations.get(int(scan["id"]), 0) < scan_cap(scan)]
+            now = time.monotonic()
+            eligible = [
+                scan
+                for scan in scans
+                if self._scan_allocations.get(int(scan["id"]), 0) < scan_cap(scan)
+                and self._scan_no_work_until.get(int(scan["id"]), 0.0) <= now
+            ]
             if not eligible:
                 return None
             selected = min(
@@ -1180,6 +1208,7 @@ class Worker:
                         agent_skills=agent_skills,
                         harness_name=harness_name,
                         model_provider=model_provider,
+                        use_snapshot_image=image_workspace_enabled(data_dir=getattr(self.config, "data_dir", None)),
                     )
                     checked_out_commit = prepared.checked_out_commit
                     context = {**state.context, **workspace_context(prepared)}
@@ -1210,8 +1239,8 @@ class Worker:
                                 prompt_filled=prompt_filled,
                                 phase="interrupted",
                                 codex_source_home=getattr(prepared.workspace, "codex_source_home", None),
-                                codex_account_id=getattr(prepared.workspace, "codex_account_id", None),
-                                codex_account_email=getattr(prepared.workspace, "codex_account_email", None),
+                                codex_account_id=getattr(prepared.workspace, "provider_account_id", None),
+                                codex_account_email=getattr(prepared.workspace, "provider_account_email", None),
                             )
                             conn.commit()
                             return True
@@ -1226,8 +1255,8 @@ class Worker:
                             prompt_filled=prompt_filled,
                             phase="running_harness",
                             codex_source_home=getattr(prepared.workspace, "codex_source_home", None),
-                            codex_account_id=getattr(prepared.workspace, "codex_account_id", None),
-                            codex_account_email=getattr(prepared.workspace, "codex_account_email", None),
+                            codex_account_id=getattr(prepared.workspace, "provider_account_id", None),
+                            codex_account_email=getattr(prepared.workspace, "provider_account_email", None),
                         )
                         conn.commit()
                 except ClaudeCredentialRateLimited as exc:
@@ -1293,13 +1322,19 @@ class Worker:
                         getattr(prepared.workspace, "provider_account_home", None),
                         data_dir=getattr(self.config, "data_dir", None),
                     ):
+                        harness_arguments = {
+                            "prompt": prompt_filled,
+                            "schema": schema,
+                            "repo_dir": prepared.repo_dir,
+                            "model": selection.model,
+                            "thinking_effort": thinking_effort,
+                            "env": prepared.workspace.env,
+                        }
+                        runner_image = getattr(prepared, "runner_image", None)
+                        if runner_image:
+                            harness_arguments["runner_image"] = runner_image
                         result = harness.run(
-                            prompt=prompt_filled,
-                            schema=schema,
-                            repo_dir=prepared.repo_dir,
-                            model=selection.model,
-                            thinking_effort=thinking_effort,
-                            env=prepared.workspace.env,
+                            **harness_arguments,
                         )
                     mark_provider_account_available(
                         getattr(prepared.workspace, "provider_account_provider", None),
@@ -1404,10 +1439,10 @@ class Worker:
                             codex_source_home=getattr(prepared.workspace, "codex_source_home", None)
                             if prepared
                             else None,
-                            codex_account_id=getattr(prepared.workspace, "codex_account_id", None)
+                            codex_account_id=getattr(prepared.workspace, "provider_account_id", None)
                             if prepared
                             else None,
-                            codex_account_email=getattr(prepared.workspace, "codex_account_email", None)
+                            codex_account_email=getattr(prepared.workspace, "provider_account_email", None)
                             if prepared
                             else None,
                             phase="failed",

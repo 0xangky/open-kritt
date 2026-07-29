@@ -1123,6 +1123,7 @@ def test_run_forever_starts_a_dedicated_generation_worker(monkeypatch, tmp_path)
     worker._schedule_codex_update = lambda: None
     worker._schedule_model_catalog_refresh = lambda: None
     monkeypatch.setattr(worker_module, "cleanup_stale_scan_sandboxes", lambda: None)
+    monkeypatch.setattr(worker_module, "cleanup_stale_workspace_snapshot_builders", lambda: None)
     monkeypatch.setattr(worker_module.threading, "Thread", FakeThread)
     monkeypatch.setattr(worker_module.time, "sleep", lambda _seconds: (_ for _ in ()).throw(StopRunForever()))
 

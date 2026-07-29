@@ -42,6 +42,7 @@ describe('scan run settings', () => {
     model: 'gpt-5-codex',
     model_provider: 'codex',
     thinking_effort: 'medium',
+    post_processing_thinking_effort: 'low',
     harness: 'codex',
     model_overrides: {},
     job_limit: '250',
@@ -52,6 +53,7 @@ describe('scan run settings', () => {
       model: 'gpt-5-codex',
       model_provider: 'codex',
       thinking_effort: 'medium',
+      post_processing_thinking_effort: 'low',
       harness: 'codex',
     };
 
@@ -64,6 +66,7 @@ describe('scan run settings', () => {
       model: 'legacy-model',
       model_provider: 'openrouter',
       thinking_effort: 'medium',
+      post_processing_thinking_effort: 'medium',
       harness: 'codex',
       model_overrides: {},
       job_limit: '',
@@ -77,6 +80,12 @@ describe('scan run settings', () => {
   it('still supports setting and clearing a job limit', () => {
     expect(runSettingsPayload({ job_limit: ' 25 ' }, { ...current, job_limit: '' })).toEqual({ jobLimit: 25 });
     expect(runSettingsPayload({ job_limit: '' }, current)).toEqual({ jobLimit: null });
+  });
+
+  it('updates post-processing effort independently', () => {
+    expect(runSettingsPayload({ post_processing_thinking_effort: 'medium' }, current)).toEqual({
+      post_processing_thinking_effort: 'medium',
+    });
   });
 
   it('replaces or clears normalized workflow-depth model overrides', () => {
