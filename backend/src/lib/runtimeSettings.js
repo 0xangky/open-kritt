@@ -62,6 +62,12 @@ export const RUNTIME_SETTING_DEFINITIONS = Object.freeze({
     type: 'number',
     apply: 'live',
   }),
+  ignoreLowStorage: Object.freeze({
+    envKey: 'ENGINE_IGNORE_LOW_STORAGE',
+    defaultValue: false,
+    type: 'boolean',
+    apply: 'live',
+  }),
   workspaceSetupConcurrency: Object.freeze({
     envKey: 'ENGINE_WORKSPACE_SETUP_CONCURRENCY',
     defaultValue: 2,

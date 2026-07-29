@@ -24,6 +24,7 @@ def test_engine_config_reads_scan_storage_floor(monkeypatch, tmp_path):
     monkeypatch.setenv("ENGINE_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("ENGINE_RUNTIME_CONFIG_PATH", str(tmp_path / "runtime.env"))
     monkeypatch.setenv("ENGINE_MIN_FREE_STORAGE_GB", "23.5")
+    monkeypatch.setenv("ENGINE_IGNORE_LOW_STORAGE", "true")
     monkeypatch.setenv("ENGINE_SCAN_CACHE_RETENTION_DAYS", "3.5")
     monkeypatch.setenv("ENGINE_AUTO_PRUNE_DOCKER_BUILD_CACHE", "true")
     monkeypatch.setenv("ENGINE_AUTO_PRUNE_UNUSED_DOCKER_IMAGES", "true")
@@ -33,6 +34,7 @@ def test_engine_config_reads_scan_storage_floor(monkeypatch, tmp_path):
     config = EngineConfig.from_env()
 
     assert config.min_free_storage_bytes == int(23.5 * 1024**3)
+    assert config.ignore_low_storage is True
     assert config.scan_cache_retention_days == 3.5
     assert config.auto_prune_docker_build_cache is True
     assert config.auto_prune_unused_docker_images is True
@@ -413,6 +415,7 @@ def test_worker_blocks_new_scan_containers_below_storage_floor(monkeypatch):
     worker.db = database
     worker.config = SimpleNamespace(data_dir="/data", min_free_storage_bytes=20 * 1024**3)
     worker.runtime_min_free_storage_bytes = lambda: 20 * 1024**3
+    worker.runtime_ignore_low_storage = lambda: False
     monkeypatch.setattr(worker_module.shutil, "disk_usage", lambda _path: SimpleNamespace(free=19 * 1024**3))
 
     assert worker._new_scan_container_allowed(58) is False
@@ -435,6 +438,7 @@ def test_worker_clears_storage_warning_before_launching_after_recovery(monkeypat
     worker.db = database
     worker.config = SimpleNamespace(data_dir="/data", min_free_storage_bytes=20 * 1024**3)
     worker.runtime_min_free_storage_bytes = lambda: 20 * 1024**3
+    worker.runtime_ignore_low_storage = lambda: False
     monkeypatch.setattr(worker_module.shutil, "disk_usage", lambda _path: SimpleNamespace(free=21 * 1024**3))
 
     assert worker._new_scan_container_allowed(58) is True
@@ -448,6 +452,7 @@ def test_low_storage_requests_a_docker_cache_prune(monkeypatch):
     worker.db = database
     worker.config = SimpleNamespace(data_dir="/data", min_free_storage_bytes=20 * 1024**3)
     worker.runtime_min_free_storage_bytes = lambda: 20 * 1024**3
+    worker.runtime_ignore_low_storage = lambda: False
     prune_requests = []
     worker._schedule_docker_storage_cleanup = lambda: prune_requests.append(True)
     monkeypatch.setattr(worker_module.shutil, "disk_usage", lambda _path: SimpleNamespace(free=19 * 1024**3))
@@ -458,11 +463,41 @@ def test_low_storage_requests_a_docker_cache_prune(monkeypatch):
 
 def test_worker_reads_live_scan_storage_floor(monkeypatch, tmp_path):
     monkeypatch.delenv("ENGINE_RUNTIME_CONFIG_PATH", raising=False)
-    (tmp_path / "engine-runtime.env").write_text("ENGINE_MIN_FREE_STORAGE_GB=17.5\n", encoding="utf-8")
+    (tmp_path / "engine-runtime.env").write_text(
+        "ENGINE_MIN_FREE_STORAGE_GB=17.5\nENGINE_IGNORE_LOW_STORAGE=true\n",
+        encoding="utf-8",
+    )
     worker = Worker.__new__(Worker)
-    worker.config = SimpleNamespace(data_dir=str(tmp_path), min_free_storage_bytes=20 * 1024**3)
+    worker.config = SimpleNamespace(
+        data_dir=str(tmp_path),
+        min_free_storage_bytes=20 * 1024**3,
+        ignore_low_storage=False,
+    )
 
     assert worker.runtime_min_free_storage_bytes() == int(17.5 * 1024**3)
+    assert worker.runtime_ignore_low_storage() is True
+
+
+def test_worker_ignores_low_storage_and_clears_existing_warning(monkeypatch):
+    database = _StorageDatabase()
+    worker = Worker.__new__(Worker)
+    worker.db = database
+    worker.config = SimpleNamespace(
+        data_dir="/data",
+        min_free_storage_bytes=20 * 1024**3,
+        ignore_low_storage=True,
+    )
+    worker.runtime_min_free_storage_bytes = lambda: 20 * 1024**3
+    worker.runtime_ignore_low_storage = lambda: True
+    monkeypatch.setattr(
+        worker_module.shutil,
+        "disk_usage",
+        lambda _path: pytest.fail("disabled storage safeguard must not inspect disk usage"),
+    )
+
+    assert worker._new_scan_container_allowed(58) is True
+    assert database.warnings == []
+    assert database.cleared == [58]
 
 
 def test_completion_cleanup_uses_zero_grace_for_finished_scan_caches():

@@ -406,6 +406,13 @@ class Worker:
             * 1024**3
         )
 
+    def runtime_ignore_low_storage(self) -> bool:
+        return runtime_bool(
+            "ENGINE_IGNORE_LOW_STORAGE",
+            bool(getattr(self.config, "ignore_low_storage", False)),
+            data_dir=getattr(self.config, "data_dir", None),
+        )
+
     def _harness_for_model_selection(self, selection: ModelSelection):
         return harness_for(
             normalize_harness_name(selection.harness),
@@ -765,7 +772,12 @@ class Worker:
 
     def _new_scan_container_allowed(self, scan_id: int) -> bool:
         required_bytes = self.runtime_min_free_storage_bytes()
-        if required_bytes <= 0:
+        if self.runtime_ignore_low_storage() or required_bytes <= 0:
+            warning_clearer = getattr(self.db, "clear_scan_storage_warning", None)
+            if callable(warning_clearer):
+                with self.db.connect() as conn:
+                    warning_clearer(conn, scan_id)
+                    conn.commit()
             return True
 
         free_bytes: int | None = None

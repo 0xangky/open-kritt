@@ -334,7 +334,7 @@ export function knownError(value) {
       key: 'storage_warning_persistence_failed',
       title: 'Low-storage pause failed',
       message:
-        'The engine ran low on disk space, then could not save its automatic pause warning. Free disk space or lower Minimum free storage in Settings, then resume the scan; completed work is preserved.',
+        'The engine ran low on disk space, then could not save its automatic pause warning. Free disk space, lower Minimum free storage, or enable Ignore low-storage safeguard in Settings, then resume the scan; completed work is preserved.',
       fixLinks: [{ label: 'Open Settings', url: '/settings', internal: true }],
     };
   }

@@ -40,6 +40,7 @@ test('settings API exposes the whitelisted runtime settings', async () => {
       'autoscaleScanWorkersOnProviderCapacity',
       'codexMaxSubagentsPerSession',
       'minFreeStorageGb',
+      'ignoreLowStorage',
       'workspaceSetupConcurrency',
       'retryCount',
       'harnessTimeoutSeconds',
@@ -81,6 +82,9 @@ test('runtime settings expose only whitelisted effective values and their source
   assert.equal(result.settings.minFreeStorageGb.source, 'process_environment');
   assert.equal(result.settings.minFreeStorageGb.type, 'number');
   assert.equal(result.settings.minFreeStorageGb.step, 0.1);
+  assert.equal(result.settings.ignoreLowStorage.value, false);
+  assert.equal(result.settings.ignoreLowStorage.source, 'default');
+  assert.equal(result.settings.ignoreLowStorage.type, 'boolean');
   assert.equal(result.capabilities.perScanConcurrency.available, true);
   assert.doesNotMatch(JSON.stringify(result), /must-not-leak|secret\/account|GITHUB_TOKEN|OPENROUTER_API_KEY/);
 });
@@ -98,6 +102,7 @@ test('runtime setting updates apply live and persist without overwriting unrelat
       autoscaleScanWorkersOnProviderCapacity: false,
       codexMaxSubagentsPerSession: 5,
       minFreeStorageGb: 18.5,
+      ignoreLowStorage: true,
     },
     {
       ...paths,
@@ -115,6 +120,7 @@ test('runtime setting updates apply live and persist without overwriting unrelat
   assert.equal(runtimeValues.ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY, 'false');
   assert.equal(runtimeValues.ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION, '5');
   assert.equal(runtimeValues.ENGINE_MIN_FREE_STORAGE_GB, '18.5');
+  assert.equal(runtimeValues.ENGINE_IGNORE_LOW_STORAGE, 'true');
   assert.equal(runtimeValues.ENGINE_CODEX_HOME, '/account');
   assert.equal(projectValues.ENGINE_WORKER_COUNT, '5');
   assert.equal(projectValues.ENGINE_WORKERS_PER_ACCOUNT, '12');
@@ -122,6 +128,7 @@ test('runtime setting updates apply live and persist without overwriting unrelat
   assert.equal(projectValues.ENGINE_AUTOSCALE_SCAN_WORKERS_ON_PROVIDER_CAPACITY, 'false');
   assert.equal(projectValues.ENGINE_CODEX_MAX_SUBAGENTS_PER_SESSION, '5');
   assert.equal(projectValues.ENGINE_MIN_FREE_STORAGE_GB, '18.5');
+  assert.equal(projectValues.ENGINE_IGNORE_LOW_STORAGE, 'true');
   assert.equal(projectValues.KEEP, 'value');
   assert.match(runtimeText, /^# live settings$/m);
   assert.match(projectText, /^# project settings$/m);
@@ -132,6 +139,7 @@ test('runtime setting updates apply live and persist without overwriting unrelat
   assert.equal(result.settings.autoscaleScanWorkersOnProviderCapacity.value, false);
   assert.equal(result.settings.codexMaxSubagentsPerSession.value, 5);
   assert.equal(result.settings.minFreeStorageGb.value, 18.5);
+  assert.equal(result.settings.ignoreLowStorage.value, true);
 });
 
 test('runtime setting validation rejects unknown, fractional, and out-of-range values', () => {
@@ -169,6 +177,10 @@ test('runtime setting validation rejects unknown, fractional, and out-of-range v
   assert.deepEqual(validateRuntimeSettingsPatch({ minFreeStorageGb: '17.5' }), {
     minFreeStorageGb: 17.5,
   });
+  assert.deepEqual(validateRuntimeSettingsPatch({ ignoreLowStorage: true }), {
+    ignoreLowStorage: true,
+  });
+  assert.throws(() => validateRuntimeSettingsPatch({ ignoreLowStorage: 'true' }), ValidationError);
   assert.throws(() => validateRuntimeSettingsPatch({ minFreeStorageGb: 'not-a-number' }), ValidationError);
   assert.throws(() => validateRuntimeSettingsPatch({ minFreeStorageGb: 1025 }), ValidationError);
 });

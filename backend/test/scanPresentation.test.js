@@ -272,7 +272,7 @@ test('low-storage warning persistence failures explain the pause bug', () => {
   assert.equal(
     cleanError(message),
     'Low-storage pause failed. The engine ran low on disk space, then could not save its automatic pause warning. ' +
-      'Free disk space or lower Minimum free storage in Settings, then resume the scan; completed work is preserved.'
+      'Free disk space, lower Minimum free storage, or enable Ignore low-storage safeguard in Settings, then resume the scan; completed work is preserved.'
   );
   assert.deepEqual(knownError(message)?.fixLinks, [{ label: 'Open Settings', url: '/settings', internal: true }]);
 });

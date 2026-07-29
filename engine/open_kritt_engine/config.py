@@ -44,6 +44,7 @@ class EngineConfig:
     harness_timeout_seconds: int
     data_dir: str
     min_free_storage_bytes: int
+    ignore_low_storage: bool
     scan_cache_retention_days: float
     auto_prune_docker_build_cache: bool
     auto_prune_unused_docker_images: bool
@@ -97,6 +98,7 @@ class EngineConfig:
             ),
             data_dir=data_dir,
             min_free_storage_bytes=int(max(0.0, _float_env("ENGINE_MIN_FREE_STORAGE_GB", 20.0)) * 1024**3),
+            ignore_low_storage=_bool_env("ENGINE_IGNORE_LOW_STORAGE", False),
             scan_cache_retention_days=max(0.0, _float_env("ENGINE_SCAN_CACHE_RETENTION_DAYS", 0.0)),
             auto_prune_docker_build_cache=_bool_env("ENGINE_AUTO_PRUNE_DOCKER_BUILD_CACHE", True),
             auto_prune_unused_docker_images=_bool_env("ENGINE_AUTO_PRUNE_UNUSED_DOCKER_IMAGES", True),
