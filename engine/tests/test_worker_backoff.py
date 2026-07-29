@@ -610,6 +610,44 @@ def test_fair_scheduler_honors_a_hard_per_scan_worker_cap():
     assert worker._reserve_scan() is None
 
 
+def test_fair_scheduler_lends_unused_workers_to_a_scan_that_can_claim_work(monkeypatch):
+    scans = [{"id": 1, "inserted_at": "1"}, {"id": 2, "inserted_at": "2"}]
+    worker = _pool_worker(worker_count=6, max_per_scan=0, scans=scans)
+    worker.config.poll_seconds = 5
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: 100.0)
+
+    first = worker._reserve_scan()
+    second = worker._reserve_scan()
+    worker._record_scan_claim_result(second["id"], did_work=False)
+    worker._release_scan(second["id"])
+    borrowed = [worker._reserve_scan()["id"] for _ in range(5)]
+
+    assert first["id"] == 1
+    assert second["id"] == 2
+    assert borrowed == [1, 1, 1, 1, 1]
+    assert worker._reserve_scan() is None
+
+
+def test_fair_scheduler_retries_a_scan_after_its_no_work_cooldown(monkeypatch):
+    scans = [{"id": 1, "inserted_at": "1"}, {"id": 2, "inserted_at": "2"}]
+    worker = _pool_worker(worker_count=2, max_per_scan=0, scans=scans)
+    worker.config.poll_seconds = 5
+    clock = [100.0]
+    monkeypatch.setattr(worker_module.time, "monotonic", lambda: clock[0])
+
+    first = worker._reserve_scan()
+    second = worker._reserve_scan()
+    worker._record_scan_claim_result(second["id"], did_work=False)
+    worker._release_scan(second["id"])
+    clock[0] += 5
+
+    retried = worker._reserve_scan()
+
+    assert first["id"] == 1
+    assert second["id"] == 2
+    assert retried["id"] == 2
+
+
 def test_fair_scheduler_honors_a_scan_specific_provider_capacity_cap():
     scans = [
         {

@@ -1070,6 +1070,7 @@ function ScanRunSettings({
           <RuntimeSetting label="model" value={current.model} />
           <RuntimeSetting label="model_provider" value={current.model_provider || '—'} />
           <RuntimeSetting label="thinking_effort" value={current.thinking_effort || '—'} />
+          <RuntimeSetting label="post-processing effort" value={current.post_processing_thinking_effort || '—'} />
           <RuntimeSetting label="harness" value={current.harness} />
           <RuntimeSetting label="depth overrides" value={Object.keys(current.model_overrides).length || 'none'} />
           <RuntimeSetting
@@ -1087,6 +1088,7 @@ export function runSettingsDraft(scan = {}) {
     model: scan.model || '',
     model_provider: scan.modelProvider || 'openrouter',
     thinking_effort: scan.thinkingEffort || 'medium',
+    post_processing_thinking_effort: scan.postProcessingThinkingEffort || scan.thinkingEffort || 'medium',
     harness: scan.harness || 'codex',
     model_overrides: modelOverridesDraft(scan.modelOverrides),
     job_limit: scan.jobLimit == null ? '' : `${scan.jobLimit}`,
@@ -1105,6 +1107,10 @@ export function mergeRunSettingsDraft(current = {}, patch = {}) {
     model: runSettingsValue(current?.model, ''),
     model_provider: runSettingsValue(current?.model_provider, 'openrouter'),
     thinking_effort: runSettingsValue(current?.thinking_effort, 'medium'),
+    post_processing_thinking_effort: runSettingsValue(
+      current?.post_processing_thinking_effort,
+      current?.thinking_effort || 'medium'
+    ),
     harness: runSettingsValue(current?.harness, 'codex'),
     model_overrides: modelOverridesDraft(current?.model_overrides),
     job_limit: runSettingsValue(current?.job_limit, ''),
@@ -1113,6 +1119,10 @@ export function mergeRunSettingsDraft(current = {}, patch = {}) {
     model: runSettingsValue(patch?.model, base.model),
     model_provider: runSettingsValue(patch?.model_provider, base.model_provider),
     thinking_effort: runSettingsValue(patch?.thinking_effort, base.thinking_effort),
+    post_processing_thinking_effort: runSettingsValue(
+      patch?.post_processing_thinking_effort,
+      base.post_processing_thinking_effort
+    ),
     harness: runSettingsValue(patch?.harness, base.harness),
     model_overrides: hasModelOverrides ? modelOverridesDraft(patch.model_overrides) : base.model_overrides,
     job_limit: runSettingsValue(patch?.job_limit, base.job_limit),
@@ -1130,6 +1140,8 @@ export function runSettingsPayload(draft, current) {
     payload.model_provider = normalizedDraft.model_provider;
   if (normalizedDraft.thinking_effort !== normalizedCurrent.thinking_effort)
     payload.thinking_effort = normalizedDraft.thinking_effort;
+  if (normalizedDraft.post_processing_thinking_effort !== normalizedCurrent.post_processing_thinking_effort)
+    payload.post_processing_thinking_effort = normalizedDraft.post_processing_thinking_effort;
   if (normalizedDraft.harness !== normalizedCurrent.harness) payload.harness = normalizedDraft.harness;
   if (!modelOverridesEqual(normalizedDraft.model_overrides, normalizedCurrent.model_overrides))
     payload.model_overrides = normalizedDraft.model_overrides;

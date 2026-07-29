@@ -316,6 +316,11 @@ export function serializeScan(
     modelProvider: scan.modelProvider ?? null,
     harness: scan.harness,
     thinkingEffort: scan.thinkingEffort ?? null,
+    postProcessingThinkingEffort:
+      scan.configuration?.post_processing_thinking_effort ??
+      scan.configuration?.postProcessingThinkingEffort ??
+      scan.thinkingEffort ??
+      null,
     modelOverrides: serializeModelOverrides(scan.modelOverrides),
     status: scan.status,
     workflowId: scan.workflowId.toString(),

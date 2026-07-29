@@ -229,6 +229,31 @@ test('runtime scan updates validate the complete prospective model selection', a
   assert.deepEqual(checkedSelection, { ...current, model: 'gpt-5.6' });
 });
 
+test('runtime scan updates validate a separate post-processing thinking effort', async () => {
+  const current = {
+    model: 'gpt-5.5',
+    modelProvider: 'codex',
+    harness: 'codex',
+    thinkingEffort: 'high',
+    configuration: { post_processing_thinking_effort: 'high' },
+  };
+  const checkedSelections = [];
+
+  const data = await validateScanRuntimeUpdate({ post_processing_thinking_effort: 'medium' }, current, {
+    assertAvailable: async (selection) => checkedSelections.push(selection),
+  });
+
+  assert.deepEqual(data, { postProcessingThinkingEffort: 'medium' });
+  assert.deepEqual(checkedSelections, [
+    {
+      model: 'gpt-5.5',
+      modelProvider: 'codex',
+      harness: 'codex',
+      thinkingEffort: 'medium',
+    },
+  ]);
+});
+
 test('runtime scan updates validate and replace depth model overrides', async () => {
   const current = {
     model: 'gpt-5.5',

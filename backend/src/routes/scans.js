@@ -154,7 +154,7 @@ export async function assertModelOverridesAvailable(modelOverrides, assertAvaila
 
 export async function validateScanRuntimeUpdate(body, current, { assertAvailable, allowedDepths = null } = {}) {
   const runtime = validateProspectiveScanRuntimeSettings(body, current, { allowedDepths });
-  if (!runtime.selection && runtime.modelOverrides === null) return {};
+  if (!runtime.selection && !runtime.postProcessingSelection && runtime.modelOverrides === null) return {};
   if (typeof assertAvailable !== 'function') {
     throw new TypeError('Runtime model availability validation requires a transaction-aware checker.');
   }
@@ -167,6 +167,15 @@ export async function validateScanRuntimeUpdate(body, current, { assertAvailable
       harness: runtime.selection.harness,
       thinkingEffort: runtime.selection.thinkingEffort,
     });
+  }
+  if (
+    runtime.postProcessingSelection &&
+    JSON.stringify(runtime.postProcessingSelection) !== JSON.stringify(runtime.selection)
+  ) {
+    await assertSelectionAvailable(assertAvailable, runtime.postProcessingSelection, 'post_processing');
+  }
+  if (Object.prototype.hasOwnProperty.call(runtime.data, 'postProcessingThinkingEffort')) {
+    data.postProcessingThinkingEffort = runtime.data.postProcessingThinkingEffort;
   }
   if (runtime.modelOverrides !== null) {
     await assertModelOverridesAvailable(runtime.modelOverrides, assertAvailable);
@@ -231,13 +240,20 @@ export async function patchScanIfPresent(tx, scanId, body, { assertAvailable, av
     Object.prototype.hasOwnProperty.call(body, 'model_overrides') ||
     Object.prototype.hasOwnProperty.call(body, 'modelOverrides');
   const allowedDepths = hasModelOverrides ? await scanWorkflowDepths(tx, existing.workflowId) : null;
-  Object.assign(
-    data,
-    await validateScanRuntimeUpdate(body, existing, {
-      assertAvailable: availabilityChecker,
-      allowedDepths,
-    })
-  );
+  const runtimeData = await validateScanRuntimeUpdate(body, existing, {
+    assertAvailable: availabilityChecker,
+    allowedDepths,
+  });
+  if (Object.prototype.hasOwnProperty.call(runtimeData, 'postProcessingThinkingEffort')) {
+    data.configuration = {
+      ...(existing.configuration && typeof existing.configuration === 'object' && !Array.isArray(existing.configuration)
+        ? existing.configuration
+        : {}),
+      post_processing_thinking_effort: runtimeData.postProcessingThinkingEffort,
+    };
+    delete runtimeData.postProcessingThinkingEffort;
+  }
+  Object.assign(data, runtimeData);
   if (Object.keys(data).length === 0) {
     throw new ValidationError([{ field: 'scan', message: 'Provide a status or runtime setting to update.' }]);
   }
@@ -363,6 +379,10 @@ router.post('/', async (req, res, next) => {
   try {
     const valid = validateScan(req.body, { localNames: localRepoNames() });
     await assertModelSelectionAvailable(valid);
+    await assertModelSelectionAvailable({
+      ...valid,
+      thinkingEffort: valid.postProcessingThinkingEffort,
+    });
     const activeScanCount = await prisma.scan.count({ where: { status: { in: ACTIVE_SCAN_STATUSES } } });
     const launchDecision = scanLaunchDecision(req.body, activeScanCount);
     if (launchDecision.kind === 'choice-required') {
@@ -510,6 +530,7 @@ router.post('/', async (req, res, next) => {
             ...configurationObject,
             post_script_ids: configuredPostScriptIds,
             agent_skill_ids: configuredAgentSkillIds,
+            post_processing_thinking_effort: valid.postProcessingThinkingEffort,
           },
           model: valid.model,
           modelProvider: valid.modelProvider,

@@ -23,7 +23,15 @@ from open_kritt_engine.harnesses import (
     HarnessOutput,
     HarnessResult,
 )
-from open_kritt_engine.models import Job, State, Step, StepResultRow, Workflow, model_selection_for_depth
+from open_kritt_engine.models import (
+    Job,
+    State,
+    Step,
+    StepResultRow,
+    Workflow,
+    model_selection_for_depth,
+    post_processing_thinking_effort,
+)
 from open_kritt_engine.post_processing import (
     PostProcessor,
     PostProcessRateLimited,
@@ -52,6 +60,7 @@ from open_kritt_engine.runtime_config import ensure_runtime_config_file
 from open_kritt_engine.schema import EXTRACTOR_HELPER_FIELD, OutputValidationError, output_schema, validate_payload
 from open_kritt_engine.worker import Worker
 from open_kritt_engine.workspace import (
+    _configured_claude_homes,
     _configured_codex_homes,
     _dependency_alias,
     cleanup_job_workspace,
@@ -132,6 +141,17 @@ def test_model_selection_resolves_depth_override_and_keeps_default_for_post_proc
     assert model_selection_for_depth(configured, 1).model_provider == "claude"
     assert model_selection_for_depth(configured, 0).model == "test-model"
     assert model_selection_for_depth(configured).model == "test-model"
+
+
+def test_post_processing_thinking_effort_is_independent_from_workflow_effort():
+    configured = {
+        **scan({"post_processing_thinking_effort": "medium"}),
+        "thinking_effort": "high",
+    }
+
+    assert model_selection_for_depth(configured).thinking_effort == "high"
+    assert post_processing_thinking_effort(configured) == "medium"
+    assert post_processing_thinking_effort({**configured, "configuration": {}}) == "high"
 
 
 def fake_cache_git_head(path):
@@ -521,6 +541,50 @@ def test_prepare_dependency_workspace_writes_manifest_and_layout(monkeypatch, tm
     bundle_text = bundle_file.read_text(encoding="utf-8")
     assert 'name: "open-kritt-selected-skills"' in bundle_text
     assert "Trace attacker input to sinks." in bundle_text
+
+
+def test_prepare_dependency_workspace_uses_cached_snapshot_image_without_copying_worktree(monkeypatch, tmp_path):
+    def fake_checkout_repo(repo_full, commit_sha, base_dir, github_token=None):
+        path = Path(base_dir) / repo_full.replace("/", "__")
+        path.mkdir(parents=True, exist_ok=True)
+        (path / ".git").mkdir(exist_ok=True)
+        (path / "repo.txt").write_text(repo_full, encoding="utf-8")
+        return str(path), f"commit-{repo_full.split('/')[-1]}"
+
+    captured = {}
+
+    def fake_snapshot_image(**kwargs):
+        captured.update(kwargs)
+        return "open-kritt-workspace-snapshot:test"
+
+    monkeypatch.setattr(workspace_module, "checkout_repo", fake_checkout_repo)
+    monkeypatch.setattr(workspace_module, "_git_head_commit", fake_cache_git_head)
+    monkeypatch.setattr(workspace_module, "ensure_workspace_snapshot_image", fake_snapshot_image)
+    monkeypatch.setattr(
+        workspace_module,
+        "copy_checkout",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("snapshot mode must not copy worktrees")),
+    )
+
+    prepared = prepare_dependency_workspace(
+        data_dir=str(tmp_path / "data"),
+        checkout_cache_dir=str(tmp_path / "cache"),
+        metadata_id=47,
+        scan={
+            **scan(),
+            "commit_sha": "abc123",
+            "dependencies_detail": [{"kind": "remote", "repo_full": "anza-xyz/agave", "commit_sha": "def456"}],
+        },
+        use_snapshot_image=True,
+    )
+
+    assert prepared.runner_image == "open-kritt-workspace-snapshot:test"
+    assert prepared.source_repo_dir == captured["sources"][0][0]
+    assert captured["sources"][0][1] == "/workspace"
+    assert captured["sources"][1][1] == "/workspace/agave"
+    assert Path(prepared.repo_dir).is_dir()
+    assert {path.name for path in Path(prepared.repo_dir).iterdir()} == {"WORKSPACE.json", "WORKSPACE.md"}
+    assert json.loads(prepared.manifest_json)["primary"]["path"] == "/workspace"
 
 
 def test_prewarm_scan_checkout_cache_only_populates_cache(monkeypatch, tmp_path):
@@ -1680,6 +1744,10 @@ def test_job_workspace_copies_only_claude_credentials(monkeypatch, tmp_path):
     (backup_dir / ".claude.json.backup.123").write_text('{"restored":true}', encoding="utf-8")
     credential = '{"claudeAiOauth":{"accessToken":"test","refreshToken":"refresh","expiresAt":9999999999999}}'
     (claude_home / ".credentials.json").write_text(credential, encoding="utf-8")
+    (claude_home / ".open-kritt-account.json").write_text(
+        '{"provider":"claude","accountId":"claude-account-id","email":"researcher@example.test"}',
+        encoding="utf-8",
+    )
     (claude_home / "settings.json").write_text('{"hooks":{"PreToolUse":"leak"}}', encoding="utf-8")
     monkeypatch.setenv("CLAUDE_HOME", str(claude_home))
 
@@ -1695,6 +1763,12 @@ def test_job_workspace_copies_only_claude_credentials(monkeypatch, tmp_path):
     assert (job_claude_home / ".claude.json").read_text(encoding="utf-8") == "{}\n"
     assert not (job_claude_home / "backups").exists()
     assert not (job_claude_home / "settings.json").exists()
+    assert workspace.provider_account_provider == "claude"
+    assert workspace.provider_account_home == str(claude_home)
+    assert workspace.provider_account_id == "claude-account-id"
+    assert workspace.provider_account_email == "researcher@example.test"
+    assert workspace.codex_account_id is None
+    assert workspace.codex_account_email is None
 
 
 def test_job_workspace_rotates_between_configured_codex_homes(monkeypatch, tmp_path):
@@ -1722,6 +1796,35 @@ def test_job_workspace_rotates_between_configured_codex_homes(monkeypatch, tmp_p
     assert (Path(workspace_1.env["CODEX_HOME"]) / "auth.json").read_text(encoding="utf-8") == '{"account":"a"}'
     assert (Path(workspace_2.env["CODEX_HOME"]) / "auth.json").read_text(encoding="utf-8") == '{"account":"b"}'
     assert (Path(workspace_3.env["CODEX_HOME"]) / "auth.json").read_text(encoding="utf-8") == '{"account":"a"}'
+
+
+def test_claude_rotation_reloads_live_account_list_without_engine_restart(monkeypatch, tmp_path):
+    monkeypatch.delenv("ENGINE_RUNTIME_CONFIG_PATH", raising=False)
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    runtime_path = data_dir / "engine-runtime.env"
+    home_a = tmp_path / "claude-accounts" / "account-a" / ".claude"
+    home_b = tmp_path / "claude-accounts" / "account-b" / ".claude"
+    home_a.mkdir(parents=True)
+    home_b.mkdir(parents=True)
+    (home_a / ".credentials.json").write_text("{}", encoding="utf-8")
+    (home_b / ".credentials.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(workspace_module, "_provider_account_health", lambda _provider: {})
+
+    runtime_path.write_text(f"ENGINE_CLAUDE_HOME={home_a}\n", encoding="utf-8")
+    assert _configured_claude_homes(data_dir=str(data_dir)) == [str(home_a)]
+    assert provider_home_for_job("claude", 1, data_dir=str(data_dir)) == str(home_a)
+
+    runtime_path.write_text(f"ENGINE_CLAUDE_HOME={home_a},{home_b}\n", encoding="utf-8")
+    assert _configured_claude_homes(data_dir=str(data_dir)) == [str(home_a), str(home_b)]
+    assert {
+        provider_home_for_job("claude", 2, data_dir=str(data_dir)),
+        provider_home_for_job("claude", 3, data_dir=str(data_dir)),
+    } == {str(home_a), str(home_b)}
+
+    runtime_path.write_text(f"ENGINE_CLAUDE_HOME={home_b}\n", encoding="utf-8")
+    assert _configured_claude_homes(data_dir=str(data_dir)) == [str(home_b)]
+    assert provider_home_for_job("claude", 4, data_dir=str(data_dir)) == str(home_b)
 
 
 @pytest.mark.parametrize("provider", ["codex", "claude"])
@@ -2457,6 +2560,51 @@ def test_worker_retries_strict_validation_then_writes_results(monkeypatch, tmp_p
     assert fake_db.metadata[0]["harness"] == "claude-code"
     assert fake_db.metadata[0]["model_provider"] == "claude"
     assert fake_db.step_results[0]["json_answer"] == {"thing": "ok"}
+    assert not root.exists()
+
+
+def test_worker_uses_snapshot_image_for_normal_workflow_jobs(monkeypatch, tmp_path):
+    runtime_path = tmp_path / "engine-runtime.env"
+    runtime_path.write_text("ENGINE_POST_PROCESS_WORKSPACE_MODE=image\n", encoding="utf-8")
+    monkeypatch.setenv("ENGINE_RUNTIME_CONFIG_PATH", str(runtime_path))
+    root = tmp_path / "job"
+    root.mkdir()
+
+    class Workspace:
+        root_dir = str(root)
+        env = {"HOME": str(tmp_path / "home")}
+
+    prepared = SimpleNamespace(
+        workspace=Workspace(),
+        repo_dir=str(root / "workspace"),
+        checked_out_commit="abc",
+        layout="Dependency repositories are checked out as top-level directories inside the same workspace root.",
+        manifest_json='{"dependencies":[]}',
+        runner_image="open-kritt-workspace-snapshot:test",
+    )
+    fake_db = FakeDb()
+    worker = Worker(
+        SimpleNamespace(retry_count=0, data_dir=str(tmp_path), github_token=None),
+        db=fake_db,
+    )
+    workspace_requests = []
+    monkeypatch.setattr(
+        worker_module,
+        "prepare_dependency_workspace",
+        lambda **kwargs: workspace_requests.append(kwargs) or prepared,
+    )
+    job = Job(
+        step=step(1, 0, multi=False, output_format='{"thing":"string"}'),
+        state=State(prev_id=0, prev_table=None, repeat_run=1, context={"repo_full": "owner/repo"}),
+    )
+    fake_harness = FakeHarness([marked({"stub": False, "stub_explanation": "", "results": [{"thing": "ok"}]})])
+
+    worker.execute_job(scan=scan(), workflow_id=3, job=job, harness=fake_harness)
+
+    assert workspace_requests[0]["use_snapshot_image"] is True
+    assert fake_harness.calls[0]["runner_image"] == "open-kritt-workspace-snapshot:test"
+    assert fake_harness.calls[0]["repo_dir"] == str(root / "workspace")
+    assert fake_db.metadata[0]["status"] == "completed"
     assert not root.exists()
 
 

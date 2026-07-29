@@ -34,6 +34,7 @@ const configured = {
   model_provider: 'codex',
   harness: 'codex',
   thinking_effort: 'high',
+  post_processing_thinking_effort: 'high',
   model_overrides: {
     0: {
       model: 'gpt-5-codex',
@@ -95,7 +96,8 @@ describe('WorkflowModelConfiguration', () => {
 
     expect(html).toContain('One model for all depths');
     expect(html).toContain('Customize by depth');
-    expect(html).toContain('DEFAULT &amp; POST-PROCESSING');
+    expect(html).toContain('DEFAULT WORKFLOW MODEL');
+    expect(html).toContain('POST-PROCESSING THINKING EFFORT');
     expect(html).toContain('DEPTH 0');
     expect(html).toContain('DEPTH 1');
     expect(html).toContain('2 steps');

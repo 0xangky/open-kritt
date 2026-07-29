@@ -76,6 +76,11 @@ def write_claude_credentials(
 
 
 class ExecutorViewSummaryTests(unittest.TestCase):
+    def setUp(self):
+        runtime_config = patch.object(server, "read_runtime_config", return_value={})
+        runtime_config.start()
+        self.addCleanup(runtime_config.stop)
+
     def test_executor_html_has_no_accounts_tab(self):
         self.assertNotIn('id="tab-accounts"', server.HTML)
         self.assertNotIn("renderAccounts", server.HTML)
@@ -118,7 +123,9 @@ class ExecutorViewSummaryTests(unittest.TestCase):
         self.assertEqual(job["model"], "claude-sonnet")
         self.assertEqual(job["modelProvider"], "claude")
         self.assertEqual(job["harness"], "claude-code")
-        self.assertEqual(server.scan_model_configuration(scan, 0)["model"], "gpt-5-codex")
+        self.assertEqual(
+            server.scan_model_configuration(scan, 0)["model"], "gpt-5-codex"
+        )
 
     def test_public_bind_requires_auth_even_for_a_loopback_host_header(self):
         self.assertTrue(server.bind_address_is_loopback("localhost"))
@@ -338,6 +345,33 @@ class ExecutorViewSummaryTests(unittest.TestCase):
         ):
             self.assertEqual(server.current_codex_home_raw(), "")
             self.assertEqual(server.configured_codex_homes(), [])
+
+    def test_claude_homes_follow_live_runtime_changes_without_restart(self):
+        runtime = {"ENGINE_CLAUDE_HOME": "/root/.claude"}
+        with patch.object(
+            server, "read_runtime_config", side_effect=lambda: dict(runtime)
+        ):
+            self.assertEqual(
+                server.configured_claude_homes(),
+                [Path("/root/.claude")],
+            )
+
+            runtime["ENGINE_CLAUDE_HOME"] = (
+                "/root/.claude,/claude-accounts/reviewer/.claude"
+            )
+            self.assertEqual(
+                server.configured_claude_homes(),
+                [
+                    Path("/root/.claude"),
+                    Path("/claude-accounts/reviewer/.claude"),
+                ],
+            )
+
+            runtime["ENGINE_CLAUDE_HOME"] = "/claude-accounts/reviewer/.claude"
+            self.assertEqual(
+                server.configured_claude_homes(),
+                [Path("/claude-accounts/reviewer/.claude")],
+            )
 
     def test_scan_summary_reports_total_and_visible_window(self):
         summary = server.summarize_scan_counts(
@@ -792,6 +826,8 @@ class ExecutorViewSummaryTests(unittest.TestCase):
 
             self.assertEqual(account["active"], 0)
             self.assertEqual(account["accounts"][0]["id"], "default")
+            self.assertEqual(account["accounts"][0]["email"], "researcher@example.test")
+            self.assertEqual(account["accounts"][0]["label"], "researcher@example.test")
             self.assertFalse(account["accounts"][0]["canRemove"])
             self.assertEqual(
                 account["accounts"][0]["status"], "profile found; login required"
@@ -810,6 +846,51 @@ class ExecutorViewSummaryTests(unittest.TestCase):
             self.assertEqual(account["active"], 1)
             self.assertEqual(account["accounts"][0]["status"], "logged in")
             self.assertTrue(account["accounts"][0]["canRemove"])
+
+    def test_multiple_claude_homes_are_reported_as_distinct_removable_accounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            accounts_root = Path(directory) / "claude-accounts"
+            reviewer = accounts_root / "reviewer" / ".claude"
+            researcher = accounts_root / "researcher" / ".claude"
+            reviewer.mkdir(parents=True)
+            researcher.mkdir(parents=True)
+            write_claude_credentials(reviewer, access_token="reviewer-token")
+            write_claude_credentials(researcher, access_token="researcher-token")
+            server.CLAUDE_USAGE_CACHE = {}
+            with (
+                patch.object(server, "CLAUDE_ACCOUNTS_ROOT", accounts_root),
+                patch.object(
+                    server,
+                    "configured_claude_homes",
+                    return_value=[reviewer, researcher],
+                ),
+                patch.object(server, "current_claude_home_raw", return_value="managed"),
+                patch.object(server, "configured_secret", return_value=""),
+                patch.object(
+                    server,
+                    "fetch_claude_usage",
+                    side_effect=lambda token: claude_usage(
+                        primary=10 if token == "reviewer-token" else 20
+                    ),
+                ),
+            ):
+                result = server.fetch_claude_accounts(force=True)
+
+        self.assertEqual(result["active"], 2)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(
+            [account["id"] for account in result["accounts"]],
+            ["reviewer", "researcher"],
+        )
+        self.assertTrue(all(account["canRemove"] for account in result["accounts"]))
+        self.assertEqual(
+            [
+                account["rateLimits"]["primary"]["usedPercent"]
+                for account in result["accounts"]
+            ],
+            [10, 20],
+        )
+        self.assertEqual(len(server.CLAUDE_USAGE_CACHE), 2)
 
     def test_claude_usage_is_normalized_without_exposing_oauth_tokens(self):
         class Response:

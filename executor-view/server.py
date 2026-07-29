@@ -115,6 +115,12 @@ CODEX_HOME_RAW = os.getenv(
 CLAUDE_HOME_RAW = os.getenv(
     "EXECUTOR_VIEW_CLAUDE_HOME", os.getenv("CLAUDE_HOME", "/root/.claude")
 )
+CLAUDE_ACCOUNTS_ROOT = Path(
+    os.getenv("EXECUTOR_VIEW_CLAUDE_ACCOUNTS_ROOT", "/claude-accounts")
+).expanduser()
+CLAUDE_PRIMARY_HOME = Path(
+    os.getenv("EXECUTOR_VIEW_CLAUDE_PRIMARY_HOME", "/root/.claude")
+).expanduser()
 CODEX_ACCOUNTS_ROOT = Path(
     os.getenv("EXECUTOR_VIEW_CODEX_ACCOUNTS_ROOT", "/codex-accounts")
 ).expanduser()
@@ -201,7 +207,7 @@ RECENT_ATTEMPT_LIMIT = int(
 )
 CODEX_ACCOUNT_CACHE = {"expires_at": 0.0, "data": None}
 CODEX_USAGE_CACHE = {}
-CLAUDE_USAGE_CACHE = {"expires_at": 0.0, "credential": None, "data": None}
+CLAUDE_USAGE_CACHE = {}
 OPENROUTER_KEY_CACHE = {"expires_at": 0.0, "credential": None, "data": None}
 ACCOUNT_OVERVIEW_CACHE = {"expires_at": 0.0, "data": None}
 SCAN_STATUS_ACTIONS = {"pause": "paused", "resume": "running", "start": "running"}
@@ -382,7 +388,11 @@ def scan_model_configuration(scan, depth=None):
     overrides = scan.get("model_overrides")
     if overrides is None:
         overrides = scan.get("modelOverrides")
-    override = overrides.get(str(depth)) if depth is not None and isinstance(overrides, dict) else None
+    override = (
+        overrides.get(str(depth))
+        if depth is not None and isinstance(overrides, dict)
+        else None
+    )
     if not isinstance(override, dict):
         return default
     return {
@@ -1084,6 +1094,13 @@ def current_codex_home_raw():
     return CODEX_HOME_RAW
 
 
+def current_claude_home_raw():
+    runtime_config = read_runtime_config()
+    if "ENGINE_CLAUDE_HOME" in runtime_config:
+        return runtime_config["ENGINE_CLAUDE_HOME"]
+    return CLAUDE_HOME_RAW
+
+
 def current_worker_count():
     raw = (
         read_runtime_config().get("ENGINE_WORKER_COUNT")
@@ -1129,6 +1146,18 @@ def configured_codex_homes():
             if key not in seen:
                 seen.add(key)
                 homes.append(candidate)
+    return homes
+
+
+def configured_claude_homes():
+    seen = set()
+    homes = []
+    for raw_path in split_home_list(current_claude_home_raw()):
+        home = Path(raw_path).expanduser()
+        key = str(home)
+        if key not in seen:
+            seen.add(key)
+            homes.append(home)
     return homes
 
 
@@ -1272,7 +1301,7 @@ def build_account_overview(codex, claude, openrouter, fetched=True):
 def empty_claude_accounts():
     return {
         "generatedAt": datetime.now(timezone.utc),
-        "configuredRaw": CLAUDE_HOME_RAW,
+        "configuredRaw": current_claude_home_raw(),
         "active": 0,
         "total": 0,
         "limited": 0,
@@ -1282,8 +1311,29 @@ def empty_claude_accounts():
 
 
 def fetch_claude_accounts(force=False):
-    home = Path(CLAUDE_HOME_RAW).expanduser()
     api_key = configured_secret("ANTHROPIC_API_KEY")
+    homes = configured_claude_homes()
+    if api_key and not homes:
+        homes = [CLAUDE_PRIMARY_HOME]
+    accounts = [
+        claude_account(home, api_key=api_key if index == 0 else "", force=force)
+        for index, home in enumerate(homes)
+    ]
+    active = sum(1 for account in accounts if account["active"])
+    limited = sum(1 for account in accounts if account["statusKind"] == "limited")
+    stale = sum(1 for account in accounts if account["statusKind"] == "stale")
+    return {
+        "generatedAt": datetime.now(timezone.utc),
+        "configuredRaw": current_claude_home_raw(),
+        "active": active,
+        "total": len(accounts),
+        "limited": limited,
+        "stale": stale,
+        "accounts": accounts,
+    }
+
+
+def claude_account(home, api_key="", force=False):
     auth = load_claude_auth(home)
     oauth = load_claude_oauth(home)
     usage = claude_usage_for_account(oauth.get("accessToken"), force=force)
@@ -1366,37 +1416,49 @@ def fetch_claude_accounts(force=False):
     if auth_error:
         add_detail(details, "Authentication", auth_error)
 
-    account = {
-        "id": "default",
+    account_id = removable_claude_account_id(home)
+    return {
+        "id": account_id,
         "provider": "Claude",
-        "label": auth.get("email") or auth.get("name") or "Claude Code",
+        "label": auth.get("email") or auth.get("name") or claude_account_label(home),
         "path": str(home),
         "email": auth.get("email"),
         "name": auth.get("name"),
         "plan": auth.get("subscriptionType") or oauth.get("subscriptionType"),
         "active": active,
-        "canRemove": bool(auth.get("credentialSources")),
+        "canRemove": bool(account_id and auth.get("credentialSources")),
         "status": status,
         "statusKind": status_kind,
         "authError": auth_error,
         "details": details,
         "rateLimits": rate_limits,
     }
-    return {
-        "generatedAt": datetime.now(timezone.utc),
-        "configuredRaw": CLAUDE_HOME_RAW,
-        "active": 1 if active else 0,
-        "total": 1 if active else 0,
-        "limited": 1 if limited else 0,
-        "stale": 1 if stale else 0,
-        "accounts": [account],
-    }
+
+
+def removable_claude_account_id(home):
+    if home in {CLAUDE_PRIMARY_HOME, Path(CLAUDE_HOME_RAW).expanduser()}:
+        return "default"
+    try:
+        relative = home.relative_to(CLAUDE_ACCOUNTS_ROOT)
+    except ValueError:
+        return None
+    if len(relative.parts) != 2 or relative.parts[1] != ".claude":
+        return None
+    account_id = relative.parts[0]
+    if not ACCOUNT_ID_PATTERN.fullmatch(account_id):
+        return None
+    return account_id
+
+
+def claude_account_label(home):
+    return home.parent.name if home.name == ".claude" else home.name
 
 
 def load_claude_auth(home):
     candidates = [
         home / ".credentials.json",
         home / "credentials.json",
+        home / ".open-kritt-account.json",
         home / ".claude.json",
         home / "settings.json",
         home / "claude.json",
@@ -1427,7 +1489,9 @@ def load_claude_auth(home):
         "sources": profile_sources,
         "credentialSources": credential_sources,
         "profileSources": profile_sources,
-        "email": first_json_value(parsed, {"email", "user_email", "account_email"}),
+        "email": first_json_value(
+            parsed, {"email", "emailaddress", "user_email", "account_email"}
+        ),
         "name": first_json_value(parsed, {"name", "username", "display_name"}),
         "organization": first_json_value(
             parsed,
@@ -1532,12 +1596,9 @@ def claude_usage_for_account(access_token, force=False):
         return None
     now = time.monotonic()
     credential = secret_fingerprint(access_token)
-    cached = (
-        CLAUDE_USAGE_CACHE.get("data")
-        if CLAUDE_USAGE_CACHE.get("credential") == credential
-        else None
-    )
-    if cached and now < CLAUDE_USAGE_CACHE.get("expires_at", 0):
+    cache_entry = claude_usage_cache_entry(credential)
+    cached = cache_entry.get("data")
+    if cached and now < cache_entry.get("expires_at", 0):
         return cached
     if not force:
         if cached:
@@ -1549,9 +1610,7 @@ def claude_usage_for_account(access_token, force=False):
     result = fetch_claude_usage(access_token)
     if result.get("primary") or result.get("secondary"):
         result["stale"] = False
-        CLAUDE_USAGE_CACHE["data"] = result
-        CLAUDE_USAGE_CACHE["credential"] = credential
-        CLAUDE_USAGE_CACHE["expires_at"] = now + CLAUDE_USAGE_CACHE_SECONDS
+        store_claude_usage_cache(credential, result, now + CLAUDE_USAGE_CACHE_SECONDS)
         return result
     if cached:
         fallback = dict(cached)
@@ -1559,15 +1618,33 @@ def claude_usage_for_account(access_token, force=False):
         fallback["error"] = result.get("error") or "Claude usage check failed"
         fallback["statusCode"] = result.get("statusCode")
         fallback["attemptedAt"] = result.get("checkedAt")
-        CLAUDE_USAGE_CACHE["data"] = fallback
-        CLAUDE_USAGE_CACHE["credential"] = credential
-        CLAUDE_USAGE_CACHE["expires_at"] = now + CLAUDE_USAGE_CACHE_SECONDS
+        store_claude_usage_cache(credential, fallback, now + CLAUDE_USAGE_CACHE_SECONDS)
         return fallback
     result["stale"] = True
-    CLAUDE_USAGE_CACHE["data"] = result
-    CLAUDE_USAGE_CACHE["credential"] = credential
-    CLAUDE_USAGE_CACHE["expires_at"] = now + CLAUDE_USAGE_CACHE_SECONDS
+    store_claude_usage_cache(credential, result, now + CLAUDE_USAGE_CACHE_SECONDS)
     return result
+
+
+def claude_usage_cache_entry(credential):
+    # Accept the pre-multi-account cache shape while tests and rolling upgrades
+    # may still have it in memory.
+    if "credential" in CLAUDE_USAGE_CACHE:
+        return (
+            CLAUDE_USAGE_CACHE
+            if CLAUDE_USAGE_CACHE.get("credential") == credential
+            else {}
+        )
+    entry = CLAUDE_USAGE_CACHE.get(credential)
+    return entry if isinstance(entry, dict) else {}
+
+
+def store_claude_usage_cache(credential, data, expires_at):
+    entry = {"data": data, "expires_at": expires_at}
+    if "credential" in CLAUDE_USAGE_CACHE:
+        CLAUDE_USAGE_CACHE.update(entry)
+        CLAUDE_USAGE_CACHE["credential"] = credential
+    else:
+        CLAUDE_USAGE_CACHE[credential] = entry
 
 
 def fetch_claude_usage(access_token):

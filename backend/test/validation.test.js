@@ -171,6 +171,38 @@ test('model selection rejects non-string CLI arguments instead of coercing them'
   }
 });
 
+test('validateScan keeps post-processing thinking effort separate from workflow effort', () => {
+  const base = {
+    workflowId: '1',
+    postScriptId: '1',
+    repo_kind: 'remote',
+    repo_full: 'https://github.com/org/repo',
+    commit_sha: 'HEAD',
+    model: 'test-model',
+    model_provider: 'codex',
+    harness: 'codex',
+    thinking_effort: 'high',
+    severity_ranker: 'Rank by impact.',
+  };
+
+  const valid = validateScan({ ...base, post_processing_thinking_effort: 'medium' });
+
+  assert.equal(valid.thinkingEffort, 'high');
+  assert.equal(valid.postProcessingThinkingEffort, 'medium');
+  assert.equal(validateScan(base).postProcessingThinkingEffort, 'high');
+  assert.throws(
+    () =>
+      validateScan({
+        ...base,
+        model_provider: 'claude',
+        harness: 'claude-code',
+        post_processing_thinking_effort: 'ultra',
+      }),
+    (error) =>
+      error instanceof ValidationError && error.errors.some((item) => item.field === 'post_processing_thinking_effort')
+  );
+});
+
 test('depth model overrides normalize complete tuples and enforce workflow depths', () => {
   assert.deepEqual(
     validateModelOverrides(

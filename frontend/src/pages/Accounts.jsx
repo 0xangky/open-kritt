@@ -118,7 +118,7 @@ export default function Accounts() {
     const impact =
       provider.id === 'codex'
         ? 'This signs Codex out locally and removes its managed account home when applicable. Existing scans and results are kept.'
-        : 'This signs Claude out locally. Existing scans and results are kept.';
+        : 'This signs Claude out locally and removes its managed account home when applicable. Existing scans and results are kept.';
     if (!window.confirm(`Remove ${label}?\n\n${impact}`)) return;
     const key = `${provider.id}:${account.id}`;
     const previous = data;
@@ -355,7 +355,7 @@ export function providerActionLabel(provider) {
   const signInRequired = provider.accounts.some((account) => account.statusKind === 'expired');
   if (provider.id === 'codex') return signInRequired ? 'Sign in to Codex again' : 'Add Codex account';
   if (signInRequired) return 'Sign in to Claude again';
-  return provider.configured ? 'Reconnect Claude' : 'Sign in to Claude';
+  return 'Add Claude account';
 }
 
 export function providerReloginAccountId(provider) {
@@ -844,7 +844,7 @@ function LoginDialog({ provider, onClose, onComplete }) {
                 ? `Sign in to ${provider.label} again`
                 : provider.id === 'codex'
                   ? 'Add Codex account'
-                  : 'Sign in to Claude'}
+                  : 'Add Claude account'}
             </div>
           </div>
           <button className="account-dialog-close" type="button" aria-label="Close" onClick={cancel}>
@@ -862,7 +862,7 @@ function LoginDialog({ provider, onClose, onComplete }) {
             ) : (
               <>
                 Claude will open its subscription sign-in page. After authentication, copy the callback code into this
-                dialog to {relogin ? 'replace the expired login on this account' : 'finish linking Claude Code'}.
+                dialog to {relogin ? 'replace the expired login on this account' : 'add this Claude account'}.
               </>
             )}
           </div>

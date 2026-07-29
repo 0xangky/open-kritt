@@ -52,6 +52,19 @@ def model_selection_for_depth(scan: dict[str, Any], depth: int | None = None) ->
     )
 
 
+def post_processing_thinking_effort(scan: dict[str, Any]) -> str:
+    configuration = scan.get("configuration")
+    if not isinstance(configuration, dict):
+        configuration = {}
+    fallback = _selection_value(scan, "thinking_effort", "thinkingEffort", "medium")
+    return _selection_value(
+        configuration,
+        "post_processing_thinking_effort",
+        "postProcessingThinkingEffort",
+        fallback,
+    )
+
+
 @dataclass(frozen=True)
 class Step:
     id: int

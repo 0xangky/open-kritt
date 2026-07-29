@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 export const CLAUDE_CREDENTIAL_FILENAMES = ['.credentials.json', 'credentials.json'];
+export const CLAUDE_ACCOUNT_PROFILE_FILENAME = '.open-kritt-account.json';
 export const CLAUDE_AUTH_LOCK_NAME = '.open-kritt-auth.lock';
 
 const MAX_CREDENTIAL_BYTES = 1024 * 1024;
+const CLAUDE_PROFILE_FILENAMES = ['.claude.json', 'claude.json'];
 const LOCK_WAIT_MS = 30_000;
 const STALE_LOCK_MS = 30 * 60 * 1000;
 const CLAUDE_REFRESH_TIMEOUT_MS = 120_000;
@@ -238,9 +240,73 @@ export async function renewClaudeCredential(home, { now = Date.now, runProbe = r
   });
 }
 
+function firstProfileValue(value, keys, seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return null;
+  seen.add(value);
+  for (const [key, candidate] of Object.entries(value)) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (keys.has(normalizedKey) && (typeof candidate === 'string' || typeof candidate === 'number')) {
+      const text = String(candidate).trim();
+      if (text) return text;
+    }
+  }
+  for (const candidate of Object.values(value)) {
+    if (!candidate || typeof candidate !== 'object') continue;
+    const found = firstProfileValue(candidate, keys, seen);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function readClaudeAccountProfile(home) {
+  for (const name of CLAUDE_PROFILE_FILENAMES) {
+    const path = join(home, name);
+    try {
+      const file = await lstat(path);
+      if (file.isSymbolicLink() || !file.isFile() || file.size > MAX_CREDENTIAL_BYTES) continue;
+      const payload = JSON.parse(await readFile(path, 'utf8'));
+      const profile = {
+        provider: 'claude',
+        accountId: firstProfileValue(payload, new Set(['accountid', 'accountuuid', 'userid', 'useruuid'])),
+        email: firstProfileValue(payload, new Set(['email', 'emailaddress', 'useremail', 'accountemail'])),
+        name: firstProfileValue(payload, new Set(['name', 'username', 'displayname'])),
+        organization: firstProfileValue(
+          payload,
+          new Set(['organization', 'organizationname', 'organizationid', 'organizationuuid', 'orgid'])
+        ),
+      };
+      if (profile.accountId || profile.email || profile.name || profile.organization) return profile;
+    } catch (error) {
+      if (error?.code === 'ENOENT' || error instanceof SyntaxError) continue;
+      throw error;
+    }
+  }
+  return null;
+}
+
+async function writeClaudeAccountProfile(home, profile) {
+  if (!profile) return;
+  const targetPath = join(home, CLAUDE_ACCOUNT_PROFILE_FILENAME);
+  const temporaryPath = join(home, `.${CLAUDE_ACCOUNT_PROFILE_FILENAME}.${process.pid}.${randomUUID()}.tmp`);
+  let temporary;
+  try {
+    temporary = await open(temporaryPath, 'wx', 0o600);
+    await temporary.writeFile(`${JSON.stringify(profile, null, 2)}\n`);
+    await temporary.sync();
+    await temporary.close();
+    temporary = null;
+    await rename(temporaryPath, targetPath);
+    await chmod(targetPath, 0o600);
+  } finally {
+    await temporary?.close().catch(() => {});
+    await rm(temporaryPath, { force: true }).catch(() => {});
+  }
+}
+
 export async function promoteClaudeCredential(sourceHome, targetHome) {
   const credential = await readClaudeCredential(sourceHome);
   if (!credential) throw new Error('The provider finished without saving usable login credentials.');
+  const accountProfile = await readClaudeAccountProfile(sourceHome);
 
   return withClaudeCredentialLock(targetHome, async () => {
     const targetName = CLAUDE_CREDENTIAL_FILENAMES[0];
@@ -258,6 +324,7 @@ export async function promoteClaudeCredential(sourceHome, targetHome) {
       for (const name of CLAUDE_CREDENTIAL_FILENAMES) {
         if (name !== targetName) await rm(join(targetHome, name), { force: true });
       }
+      await writeClaudeAccountProfile(targetHome, accountProfile);
       return targetPath;
     } finally {
       await temporary?.close().catch(() => {});
